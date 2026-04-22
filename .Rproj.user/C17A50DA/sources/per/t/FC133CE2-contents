@@ -1,0 +1,242 @@
+---
+title: "Query Analytics Workloads — Data Preprocessing"
+subtitle: "Rahul · Data Engineer & Preprocessor"
+author: "Team — UCI #493 Query Analytics Workloads"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: show
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(moments)
+library(knitr)
+```
+
+# 1. Goal
+
+This notebook is the Day 1 deliverable of the 4-day sprint and mirrors
+the reproducible pipeline in `src/preprocess.R`. Its job is to take the
+three raw sub-datasets of UCI ML Repository #493 and turn them into
+clean, feature-engineered CSVs that the EDA (Day 2), modeling (Day 3),
+and validation (Day 4) stages can consume without further surgery.
+
+The whole project is built in R (no Python dependency).
+
+**Pipeline overview** (placeholder for diagram — insert `report/figures/fig00_pipeline.png` when Day 2 generates it):
+
+```
+ raw CSV ──► schema check ──► null / duplicate removal
+         ──► boundary check ──► spatial feature engineering
+         ──► log-transform targets ──► clean CSV + log CSV
+```
+
+# 2. Load raw datasets
+
+```{r load}
+raw_dir <- "../data/raw"
+range_q  <- read_csv(file.path(raw_dir, "Range-Queries-Aggregates.csv"),
+                     show_col_types = FALSE) %>%
+  select(-1) %>%                                # drop unnamed index col
+  rename(X = x, Y = y, X_range = x_range, Y_range = y_range,
+         Count = count, SUM = sum_, AVG = avg)
+
+radius_q <- read_csv(file.path(raw_dir, "Radius-Queries.csv"),
+                     col_names = c("X", "Y", "R"),
+                     show_col_types = FALSE)
+
+radius_c <- read_csv(file.path(raw_dir, "Radius-Queries-Count.csv"),
+                     col_names = c("X", "Y", "R", "Count"),
+                     show_col_types = FALSE)
+
+tibble(
+  dataset = c("range_queries", "radius_queries", "radius_count"),
+  rows    = c(nrow(range_q), nrow(radius_q), nrow(radius_c)),
+  expected = c(200000L, 50000L, 10000L)
+) %>% mutate(match = rows == expected) %>% kable()
+```
+
+All three files match the row counts documented by UCI (260,000 total
+queries).
+
+# 3. Schema validation & nulls
+
+The UCI repository card claims "no missing values". Our check finds that
+claim almost holds — with one caveat.
+
+```{r nulls}
+bind_rows(
+  range_q  %>% summarise(across(everything(), ~sum(is.na(.)))) %>% mutate(dataset = "range_queries"),
+  radius_q %>% summarise(across(everything(), ~sum(is.na(.)))) %>% mutate(dataset = "radius_queries"),
+  radius_c %>% summarise(across(everything(), ~sum(is.na(.)))) %>% mutate(dataset = "radius_count")
+) %>% select(dataset, everything()) %>% kable(caption = "Null counts per column")
+```
+
+`range_queries.AVG` contains **157 nulls**. Every one is a row where
+`Count == 0` and `SUM == 0`, so `AVG = SUM / Count` is undefined by
+construction. These are structural zeros, not data quality failures, so
+we impute `AVG = 0` for those rows and move on.
+
+```{r impute}
+range_q <- range_q %>%
+  mutate(AVG = ifelse(is.na(AVG) & Count == 0, 0, AVG))
+stopifnot(sum(is.na(range_q)) == 0)
+```
+
+# 4. Descriptive statistics
+
+```{r desc}
+describe_one <- function(df, name) {
+  df %>% summarise(across(where(is.numeric),
+    list(min = ~min(.x), max = ~max(.x),
+         mean = ~mean(.x), median = ~median(.x),
+         sd = ~sd(.x),
+         skew = ~moments::skewness(.x),
+         kurt = ~moments::kurtosis(.x)))) %>%
+    pivot_longer(everything(),
+                 names_to = c("column", ".value"),
+                 names_pattern = "(.*)_(.*)") %>%
+    mutate(dataset = name, .before = 1)
+}
+
+desc_all <- bind_rows(
+  describe_one(range_q,  "range_queries"),
+  describe_one(radius_q, "radius_queries"),
+  describe_one(radius_c, "radius_count")
+)
+kable(desc_all, digits = 4, caption = "Min / max / mean / median / SD / skew / kurtosis")
+```
+
+Observations worth carrying forward:
+
+* `Count` and `SUM` in `range_queries` are extremely right-skewed (skew > 3)
+  — a log-transform is warranted before any regression.
+* `R` (radius) is uniform-like: skew near zero, bounded support.
+* Range-queries X/Y are in Illinois State Plane feet (~1e6 magnitude);
+  radius queries are pre-normalized to roughly [0, 1]. Downstream models
+  must normalize per-dataset.
+
+# 5. De-duplication
+
+```{r dedupe}
+dedupe <- function(df) {
+  before <- nrow(df); df <- distinct(df); after <- nrow(df)
+  tibble(before = before, after = after,
+         removed = before - after,
+         retention = after / before)
+}
+
+dedupe_report <- bind_rows(
+  dedupe(range_q)  %>% mutate(dataset = "range_queries"),
+  dedupe(radius_q) %>% mutate(dataset = "radius_queries"),
+  dedupe(radius_c) %>% mutate(dataset = "radius_count")
+) %>% select(dataset, everything())
+kable(dedupe_report, digits = 5, caption = "Duplicate removal — 100% retention across all three files")
+```
+
+No exact duplicate rows exist in any of the three files.
+
+# 6. Boundary effect check
+
+A query has a boundary effect when its spatial coverage extends past
+the dataset's bounding box — meaning the true Count/SUM is truncated.
+
+```{r boundary}
+boundary_count <- function(df, kind) {
+  x_min <- min(df$X); x_max <- max(df$X)
+  y_min <- min(df$Y); y_max <- max(df$Y)
+  if (kind == "range") {
+    hx <- df$X_range / 2; hy <- df$Y_range / 2
+    cross <- (df$X - hx < x_min) | (df$X + hx > x_max) |
+             (df$Y - hy < y_min) | (df$Y + hy > y_max)
+  } else {
+    cross <- (df$X - df$R < x_min) | (df$X + df$R > x_max) |
+             (df$Y - df$R < y_min) | (df$Y + df$R > y_max)
+  }
+  sum(cross)
+}
+
+tibble(
+  dataset = c("range_queries", "radius_queries", "radius_count"),
+  boundary_rows = c(
+    boundary_count(range_q,  "range"),
+    boundary_count(radius_q, "radius"),
+    boundary_count(radius_c, "radius")
+  )
+) %>% kable()
+```
+
+The radius datasets are centered near the origin and most queries have a
+radius large enough to cross the dataset bounding box — this is a property
+of the Gaussian sampling used to generate the workload, and something
+that can be used to visualize on the EDA spatial heatmap.
+
+# 7. Spatial feature engineering
+
+```{r features}
+engineer <- function(df, kind) {
+  if (kind == "range") {
+    df$area <- 4 * df$X_range * df$Y_range
+  } else {
+    df$area <- pi * df$R^2
+  }
+  x_min <- min(df$X); x_max <- max(df$X)
+  y_min <- min(df$Y); y_max <- max(df$Y)
+  df$X_norm <- (df$X - x_min) / (x_max - x_min)
+  df$Y_norm <- (df$Y - y_min) / (y_max - y_min)
+  cx <- mean(df$X); cy <- mean(df$Y)
+  df$dist_centroid <- sqrt((df$X - cx)^2 + (df$Y - cy)^2)
+  df
+}
+
+range_q  <- engineer(range_q,  "range")
+radius_q <- engineer(radius_q, "radius")
+radius_c <- engineer(radius_c, "radius")
+```
+
+Added columns: `area`, `X_norm`, `Y_norm`, `dist_centroid`.
+
+# 8. Log-transform of Count / SUM
+
+```{r log-transform}
+log_targets <- function(df) {
+  if ("Count" %in% names(df)) df$log_Count <- log1p(df$Count)
+  if ("SUM"   %in% names(df)) df$log_SUM   <- log1p(df$SUM)
+  df
+}
+range_q_log   <- log_targets(range_q)
+radius_c_log  <- log_targets(radius_c)
+```
+
+Using `log1p` so that rows with Count = 0 map cleanly to 0 instead of
+-∞. Persons 2 and 3 get both the raw-target and log-target variants.
+
+# 9. Export clean CSVs
+
+```{r export}
+out_dir <- "../data/processed"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+write_csv(range_q,     file.path(out_dir, "clean_range_queries.csv"))
+write_csv(range_q_log, file.path(out_dir, "clean_range_queries_log.csv"))
+write_csv(radius_q,    file.path(out_dir, "clean_radius_queries.csv"))
+write_csv(radius_c,    file.path(out_dir, "clean_radius_count.csv"))
+write_csv(radius_c_log, file.path(out_dir, "clean_radius_count_log.csv"))
+```
+
+# 10. Handoff summary
+
+* 3 raw files → 5 clean CSVs in `data/processed/`
+* 260,000 rows in, 260,000 rows out (100% retention)
+* 157 structural-zero AVG imputations in `range_queries`
+* New features: `area`, `X_norm`, `Y_norm`, `dist_centroid`,
+  `log_Count`, `log_SUM`
+* Manthan should start from `clean_*_log.csv` for target distributions
+  and `clean_*.csv` for raw-scale plots.

@@ -1,0 +1,3 @@
+"0","range_q <- range_q %>%"
+"0","  mutate(AVG = ifelse(is.na(AVG) & Count == 0, 0, AVG))"
+"0","stopifnot(sum(is.na(range_q)) == 0)"

@@ -1,0 +1,5 @@
+"0","bind_rows("
+"0","  range_q  %>% summarise(across(everything(), ~sum(is.na(.)))) %>% mutate(dataset = ""range_queries""),"
+"0","  radius_q %>% summarise(across(everything(), ~sum(is.na(.)))) %>% mutate(dataset = ""radius_queries""),"
+"0","  radius_c %>% summarise(across(everything(), ~sum(is.na(.)))) %>% mutate(dataset = ""radius_count"")"
+"0",") %>% select(dataset, everything()) %>% kable(caption = ""Null counts per column"")"

@@ -1,0 +1,49 @@
+[
+  {
+    "name": "range_queries",
+    "raw_rows": 200000,
+    "duplicates_removed": 0,
+    "retention_rate": 1,
+    "null_counts": {
+      "X": 0,
+      "Y": 0,
+      "X_range": 0,
+      "Y_range": 0,
+      "Count": 0,
+      "SUM": 0,
+      "AVG": 157
+    },
+    "avg_zero_imputed": 157,
+    "boundary_rows": 1373,
+    "columns": ["X", "Y", "X_range", "Y_range", "Count", "SUM", "AVG", "area", "X_norm", "Y_norm", "dist_centroid"]
+  },
+  {
+    "name": "radius_queries",
+    "raw_rows": 50000,
+    "duplicates_removed": 0,
+    "retention_rate": 1,
+    "null_counts": {
+      "X": 0,
+      "Y": 0,
+      "R": 0
+    },
+    "avg_zero_imputed": 0,
+    "boundary_rows": 49967,
+    "columns": ["X", "Y", "R", "area", "X_norm", "Y_norm", "dist_centroid"]
+  },
+  {
+    "name": "radius_count",
+    "raw_rows": 10000,
+    "duplicates_removed": 0,
+    "retention_rate": 1,
+    "null_counts": {
+      "X": 0,
+      "Y": 0,
+      "R": 0,
+      "Count": 0
+    },
+    "avg_zero_imputed": 0,
+    "boundary_rows": 10000,
+    "columns": ["X", "Y", "R", "Count", "area", "X_norm", "Y_norm", "dist_centroid"]
+  }
+]
