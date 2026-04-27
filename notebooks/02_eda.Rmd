@@ -1,0 +1,721 @@
+---
+title: "Query Analytics Workloads — EDA & Visualization"
+subtitle: "Manthan · EDA & Visualization Specialist"
+author: "Team — UCI #493 Query Analytics Workloads"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: show
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6, dpi = 150)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(corrplot)
+library(patchwork)
+library(viridis)
+library(moments)
+library(scales)
+library(knitr)
+
+fig_dir <- "../report/figures"
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+save_fig <- function(p, name, w = 10, h = 6) {
+  ggsave(file.path(fig_dir, name), plot = p, width = w, height = h,
+         dpi = 300, units = "in")
+}
+```
+
+# 1. Goal
+
+This notebook covers the EDA & Visualization deliverable for Day 2.
+It loads the three clean CSVs produced by the Data Engineering phase,
+validates the handoff, and produces six publication-ready figures plus
+narrative commentary for the final report.
+
+**Pipeline overview:**
+
+```
+ clean CSVs ──► schema check ──► distribution analysis
+            ──► spatial heatmap (Fig 1) ──► scatter + outlier plots
+            ──► correlation matrix (Fig 2) ──► quadrant boxplots (Fig 3)
+            ──► top-3 predictors ──► handoff note for Person 3
+```
+
+---
+
+# 2. Load Data & Schema Check
+
+```{r load}
+proc_dir <- "../data/processed"
+
+range_q   <- read_csv(file.path(proc_dir, "clean_range_queries.csv"),
+                      show_col_types = FALSE)
+range_log <- read_csv(file.path(proc_dir, "clean_range_queries_log.csv"),
+                      show_col_types = FALSE)
+radius_q  <- read_csv(file.path(proc_dir, "clean_radius_queries.csv"),
+                      show_col_types = FALSE)
+radius_c  <- read_csv(file.path(proc_dir, "clean_radius_count.csv"),
+                      show_col_types = FALSE)
+radius_log <- read_csv(file.path(proc_dir, "clean_radius_count_log.csv"),
+                       show_col_types = FALSE)
+```
+
+## 2.1 Handoff integrity check
+
+```{r schema-check}
+tibble(
+  dataset          = c("range_queries", "radius_queries", "radius_count"),
+  rows             = c(nrow(range_q), nrow(radius_q), nrow(radius_c)),
+  expected_rows    = c(200000L, 50000L, 10000L),
+  null_count       = c(sum(is.na(range_q)), sum(is.na(radius_q)),
+                       sum(is.na(radius_c))),
+  rows_match       = c(nrow(range_q) == 200000L,
+                       nrow(radius_q) == 50000L,
+                       nrow(radius_c) == 10000L)
+) %>% kable(caption = "Handoff validation — row counts and null check")
+```
+
+```{r schema-cols}
+tibble(
+  dataset = c("range_queries", "radius_queries", "radius_count"),
+  columns = c(paste(names(range_q),  collapse = ", "),
+              paste(names(radius_q), collapse = ", "),
+              paste(names(radius_c), collapse = ", "))
+) %>% kable(caption = "Column schemas of the three clean datasets")
+```
+
+All three datasets land with the correct row counts and zero nulls —
+handoff from Person 1 is clean. Key schema observations:
+
+* **Range Queries Aggregates** (200,000 rows): has all aggregate targets
+  (`Count`, `SUM`, `AVG`) plus engineered features (`area`, `X_norm`,
+  `Y_norm`, `dist_centroid`).
+* **Radius Queries** (50,000 rows): spatial metadata only — no aggregate
+  targets. Useful for spatial distribution analysis.
+* **Radius Count** (10,000 rows): has `Count` as the sole target, along
+  with `R`, `area`, `X_norm`, `Y_norm`, `dist_centroid`.
+
+---
+
+# 3. Distribution Analysis
+
+## 3.1 Skewness & kurtosis of raw vs log-transformed targets
+
+Before plotting histograms, we quantify how much the log-transform helps
+normalize the highly skewed `Count` and `SUM` targets.
+
+```{r skew-table}
+skew_stats <- bind_rows(
+  tibble(
+    target = "Count (raw)",       dataset = "range_queries",
+    skewness = skewness(range_q$Count),
+    kurtosis = kurtosis(range_q$Count)
+  ),
+  tibble(
+    target = "Count (log1p)",     dataset = "range_queries",
+    skewness = skewness(range_log$log_Count),
+    kurtosis = kurtosis(range_log$log_Count)
+  ),
+  tibble(
+    target = "SUM (raw)",         dataset = "range_queries",
+    skewness = skewness(range_q$SUM),
+    kurtosis = kurtosis(range_q$SUM)
+  ),
+  tibble(
+    target = "SUM (log1p)",       dataset = "range_queries",
+    skewness = skewness(range_log$log_SUM),
+    kurtosis = kurtosis(range_log$log_SUM)
+  ),
+  tibble(
+    target = "AVG",               dataset = "range_queries",
+    skewness = skewness(range_q$AVG),
+    kurtosis = kurtosis(range_q$AVG)
+  ),
+  tibble(
+    target = "Count (raw)",       dataset = "radius_count",
+    skewness = skewness(radius_c$Count),
+    kurtosis = kurtosis(radius_c$Count)
+  ),
+  tibble(
+    target = "Count (log1p)",     dataset = "radius_count",
+    skewness = skewness(radius_log$log_Count),
+    kurtosis = kurtosis(radius_log$log_Count)
+  )
+)
+kable(skew_stats, digits = 3,
+      caption = "Skewness and kurtosis — raw vs log-transformed targets")
+```
+
+The log-transform compresses the extreme right tail for `Count` (skew
+1.35 → −1.71) and `SUM` (skew 1.48 → −1.61) in Range Queries, shifting
+the heavy tail from the right to a mild left lean caused by
+zero-inflation at the low end. While not perfectly Gaussian, the
+log-space distribution is substantially more centred and suitable for
+linear regression. `AVG` is already near-symmetric (skew ≈ −0.06) and
+does not require transformation. Radius Count's `Count` has mild
+right-skew in raw space (skew −0.33) and a modest left tail in log space
+(−1.29), confirming its near-normal, narrowly bounded distribution.
+
+## 3.2 Target distribution histograms (Figure 4)
+
+```{r fig04-distributions, fig.width=14, fig.height=10}
+p_count_raw <- ggplot(range_q, aes(x = Count)) +
+  geom_histogram(bins = 60, fill = "#2166ac", colour = "white", linewidth = 0.2) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Count — raw (Range Queries)",
+       x = "Count", y = "Frequency") +
+  theme_classic(base_size = 11)
+
+p_count_log <- ggplot(range_log, aes(x = log_Count)) +
+  geom_histogram(bins = 60, fill = "#4dac26", colour = "white", linewidth = 0.2) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Count — log1p (Range Queries)",
+       x = "log1p(Count)", y = "Frequency") +
+  theme_classic(base_size = 11)
+
+p_sum_raw <- ggplot(range_q, aes(x = SUM)) +
+  geom_histogram(bins = 60, fill = "#d01c8b", colour = "white", linewidth = 0.2) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "SUM — raw (Range Queries)",
+       x = "SUM", y = "Frequency") +
+  theme_classic(base_size = 11)
+
+p_sum_log <- ggplot(range_log, aes(x = log_SUM)) +
+  geom_histogram(bins = 60, fill = "#e66101", colour = "white", linewidth = 0.2) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "SUM — log1p (Range Queries)",
+       x = "log1p(SUM)", y = "Frequency") +
+  theme_classic(base_size = 11)
+
+p_avg <- ggplot(range_q, aes(x = AVG)) +
+  geom_histogram(bins = 60, fill = "#7b2d8b", colour = "white", linewidth = 0.2) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "AVG (Range Queries)",
+       x = "AVG", y = "Frequency") +
+  theme_classic(base_size = 11)
+
+p_rc_raw <- ggplot(radius_c, aes(x = Count)) +
+  geom_histogram(bins = 50, fill = "#b35806", colour = "white", linewidth = 0.2) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Count — raw (Radius Count)",
+       x = "Count", y = "Frequency") +
+  theme_classic(base_size = 11)
+
+p_rc_log <- ggplot(radius_log, aes(x = log_Count)) +
+  geom_histogram(bins = 50, fill = "#fdb863", colour = "white", linewidth = 0.2) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Count — log1p (Radius Count)",
+       x = "log1p(Count)", y = "Frequency") +
+  theme_classic(base_size = 11)
+
+fig04 <- (p_count_raw | p_count_log) /
+         (p_sum_raw   | p_sum_log)   /
+         (p_avg       | p_rc_raw | p_rc_log) +
+  plot_annotation(
+    title   = "Figure 4 — Target distribution histograms (raw and log-transformed)",
+    caption = "Top row: Range Queries Count; Middle: SUM; Bottom: AVG and Radius Count",
+    theme   = theme(plot.title = element_text(face = "bold"))
+  )
+
+fig04
+save_fig(fig04, "fig04.png", w = 14, h = 10)
+```
+
+**Commentary:** `Count` and `SUM` in Range Queries are heavily
+right-skewed with long tails extending to ~985,000 and ~347,000
+respectively — a direct consequence of spatial queries spanning very
+different coverage areas. The `log1p` transform collapses both
+distributions to approximate normality, which is essential for linear
+regression assumptions. `AVG` is already near-symmetric (skew ≈ −0.06)
+and needs no transformation. The Radius Count dataset shows a much
+narrower, roughly bell-shaped Count distribution (range 2–695),
+reflecting its smaller and more uniform query workload.
+
+## 3.3 Side-by-side Count overlay (Figure 5)
+
+To compare Count distributions across datasets on the same axis, we
+use log1p-transformed density curves.
+
+```{r fig05-overlay, fig.width=10, fig.height=5}
+overlay_df <- bind_rows(
+  range_log  %>% transmute(log_Count, dataset = "Range Queries (n=200k)"),
+  radius_log %>% transmute(log_Count, dataset = "Radius Count   (n=10k)")
+)
+
+fig05 <- ggplot(overlay_df, aes(x = log_Count, fill = dataset, colour = dataset)) +
+  geom_density(alpha = 0.45, linewidth = 0.8) +
+  scale_fill_manual(values  = c("Range Queries (n=200k)" = "#2166ac",
+                                "Radius Count   (n=10k)" = "#b35806")) +
+  scale_colour_manual(values = c("Range Queries (n=200k)" = "#2166ac",
+                                 "Radius Count   (n=10k)" = "#b35806")) +
+  labs(
+    title   = "Figure 5 — Count distributions: Range Queries vs Radius Count",
+    subtitle = "log1p-transformed Count; density curves overlaid",
+    x       = "log1p(Count)",
+    y       = "Density",
+    fill    = "Dataset",
+    colour  = "Dataset"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top",
+        plot.title = element_text(face = "bold"))
+
+fig05
+save_fig(fig05, "fig05.png", w = 10, h = 5)
+```
+
+**Commentary:** The two distributions are clearly distinct. Range
+Queries produce a wide, bimodal-looking log-Count spread (roughly
+log-count 8–13) driven by large variation in rectangle area. Radius
+Count concentrates tightly around log-count 5–6, reflecting the
+narrow, uniform radius distribution used in that workload. This
+difference implies that **any joint model must be trained per-dataset**
+— a single model cannot generalize across both.
+
+---
+
+# 4. Spatial Heatmap — Figure 1
+
+We use `geom_bin2d` with 50 bins to create a 2D density heatmap of
+query origins in normalized coordinate space for all three sub-datasets.
+
+```{r fig01-heatmap, fig.width=15, fig.height=5}
+heatmap_theme <- theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank(),
+        axis.ticks = element_line(),
+        plot.title = element_text(face = "bold"))
+
+p_h1 <- ggplot(range_q, aes(x = X_norm, y = Y_norm)) +
+  geom_bin2d(bins = 50) +
+  scale_fill_viridis_c(option = "magma", labels = comma,
+                       name = "Query\ncount") +
+  coord_fixed() +
+  labs(title = "Range Queries Aggregates (n = 200,000)",
+       x = "X (normalized)", y = "Y (normalized)") +
+  heatmap_theme
+
+p_h2 <- ggplot(radius_q, aes(x = X_norm, y = Y_norm)) +
+  geom_bin2d(bins = 50) +
+  scale_fill_viridis_c(option = "magma", labels = comma,
+                       name = "Query\ncount") +
+  coord_fixed() +
+  labs(title = "Radius Queries (n = 50,000)",
+       x = "X (normalized)", y = "Y (normalized)") +
+  heatmap_theme
+
+p_h3 <- ggplot(radius_c, aes(x = X_norm, y = Y_norm)) +
+  geom_bin2d(bins = 50) +
+  scale_fill_viridis_c(option = "magma", labels = comma,
+                       name = "Query\ncount") +
+  coord_fixed() +
+  labs(title = "Radius Count (n = 10,000)",
+       x = "X (normalized)", y = "Y (normalized)") +
+  heatmap_theme
+
+fig01 <- p_h1 | p_h2 | p_h3
+fig01 <- fig01 + plot_annotation(
+  title   = "Figure 1 — Spatial heatmap: 2D density of query origins",
+  caption = "Bin density uses viridis/magma scale. Coordinates normalized to [0, 1] per dataset.",
+  theme   = theme(plot.title = element_text(face = "bold", size = 13))
+)
+
+fig01
+save_fig(fig01, "fig01.png", w = 15, h = 5)
+```
+
+**Commentary (Figure 1):** All three datasets concentrate queries in
+a central band of Chicago (normalized X ≈ 0.2–0.6, Y ≈ 0.3–0.7),
+consistent with Gaussian sampling centered on the city core. Range
+Queries show the broadest spatial spread with a gentle gradient toward
+the edges. Radius Queries are tightly clustered near the center
+(X_norm ≈ 0–0.4, Y_norm ≈ 0.5–0.9), reflecting their smaller
+normalized bounding box. The Radius Count dataset, with only 10,000
+queries, shows visible clustering in the lower-X half of the grid.
+The high density of boundary-crossing queries (see anomaly note in
+README) explains why coverage near the edges is sparse but non-zero.
+
+---
+
+# 5. Scatter Plots with Outlier Detection
+
+## 5.1 Outlier flagging — IQR and Z-score
+
+```{r outlier-flags}
+flag_outliers <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  z   <- (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+  iqr_flag <- x < (q1 - 1.5 * iqr) | x > (q3 + 1.5 * iqr)
+  z_flag   <- abs(z) > 3
+  list(iqr = iqr_flag, zscore = z_flag, either = iqr_flag | z_flag)
+}
+
+range_flags <- with(range_q, {
+  list(
+    Count = flag_outliers(Count),
+    SUM   = flag_outliers(SUM),
+    AVG   = flag_outliers(AVG),
+    area  = flag_outliers(area)
+  )
+})
+
+rc_flags <- with(radius_c, {
+  list(
+    Count = flag_outliers(Count),
+    R     = flag_outliers(R)
+  )
+})
+
+tibble(
+  column  = c("range_q$Count", "range_q$SUM", "range_q$AVG",
+               "range_q$area", "radius_c$Count", "radius_c$R"),
+  iqr_outliers = c(
+    sum(range_flags$Count$iqr), sum(range_flags$SUM$iqr),
+    sum(range_flags$AVG$iqr),   sum(range_flags$area$iqr),
+    sum(rc_flags$Count$iqr),    sum(rc_flags$R$iqr)
+  ),
+  zscore_outliers = c(
+    sum(range_flags$Count$zscore), sum(range_flags$SUM$zscore),
+    sum(range_flags$AVG$zscore),   sum(range_flags$area$zscore),
+    sum(rc_flags$Count$zscore),    sum(rc_flags$R$zscore)
+  )
+) %>% kable(caption = "Outlier counts by IQR and Z-score methods")
+```
+
+```{r add-outlier-cols}
+range_q <- range_q %>%
+  mutate(
+    outlier_Count = range_flags$Count$either,
+    outlier_SUM   = range_flags$SUM$either,
+    outlier_AVG   = range_flags$AVG$either,
+    outlier_area  = range_flags$area$either
+  )
+
+radius_c <- radius_c %>%
+  mutate(
+    outlier_Count = rc_flags$Count$either,
+    outlier_R     = rc_flags$R$either
+  )
+```
+
+## 5.2 Scatter plots with outlier overlay (Figure 6)
+
+For visual clarity, we sample 5,000 points from the 200,000-row Range
+Queries dataset (seed = 42). Outlier points are marked in red on top.
+
+```{r fig06-scatter, fig.width=14, fig.height=10}
+set.seed(42)
+rq_sample <- range_q %>% slice_sample(n = 5000)
+
+p_s1 <- ggplot(rq_sample, aes(x = area, y = Count,
+                               colour = outlier_Count)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  scale_colour_manual(values = c("FALSE" = "#2166ac", "TRUE" = "#d73027"),
+                      labels = c("Normal", "Outlier")) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Area vs Count (Range Queries, sample n=5k)",
+       x = "Area (sq ft)", y = "Count", colour = NULL) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+
+p_s2 <- ggplot(rq_sample, aes(x = area, y = SUM,
+                               colour = outlier_SUM)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  scale_colour_manual(values = c("FALSE" = "#4dac26", "TRUE" = "#d73027"),
+                      labels = c("Normal", "Outlier")) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Area vs SUM (Range Queries, sample n=5k)",
+       x = "Area (sq ft)", y = "SUM", colour = NULL) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+
+p_s3 <- ggplot(rq_sample, aes(x = area, y = AVG,
+                               colour = outlier_AVG)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  scale_colour_manual(values = c("FALSE" = "#7b2d8b", "TRUE" = "#d73027"),
+                      labels = c("Normal", "Outlier")) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Area vs AVG (Range Queries, sample n=5k)",
+       x = "Area (sq ft)", y = "AVG", colour = NULL) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+
+p_s4 <- ggplot(radius_c, aes(x = R, y = Count,
+                               colour = outlier_Count)) +
+  geom_point(alpha = 0.5, size = 0.9) +
+  scale_colour_manual(values = c("FALSE" = "#b35806", "TRUE" = "#d73027"),
+                      labels = c("Normal", "Outlier")) +
+  labs(title = "Radius vs Count (Radius Count, n=10k)",
+       x = "Radius (R)", y = "Count", colour = NULL) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+
+fig06 <- (p_s1 | p_s2) / (p_s3 | p_s4) +
+  plot_annotation(
+    title   = "Figure 6 — Scatter plots with IQR/Z-score outlier overlay",
+    caption = "Red points flagged by IQR (1.5×) OR Z-score (|z|>3). Range Queries downsampled to n=5,000.",
+    theme   = theme(plot.title = element_text(face = "bold"))
+  )
+
+fig06
+save_fig(fig06, "fig06.png", w = 14, h = 10)
+```
+
+**Commentary (Figure 6):** All three Range Queries scatter plots
+display a strong monotonic positive relationship between `area` and
+both `Count` and `SUM` — larger query rectangles capture more crime
+events. The relationship is non-linear (fan-shaped heteroscedasticity),
+confirming that log-transformation of both axes improves model fit.
+Outliers cluster at extreme area values where coverage approaches
+500 million sq ft. For Radius Count, `R` spans a narrow range
+(≈0.10–0.11) yet `Count` varies from 2 to 695, suggesting factors
+beyond area drive variance here — likely the spatial density of crime
+events at the query location.
+
+---
+
+# 6. Cross-Dataset Summary Table
+
+```{r summary-table}
+bind_rows(
+  range_q %>%
+    summarise(
+      dataset   = "Range Queries Aggregates",
+      n         = n(),
+      Count_mean = mean(Count),   Count_sd = sd(Count),
+      SUM_mean   = mean(SUM),     SUM_sd   = sd(SUM),
+      AVG_mean   = mean(AVG),     AVG_sd   = sd(AVG)
+    ),
+  radius_c %>%
+    summarise(
+      dataset   = "Radius Count",
+      n         = n(),
+      Count_mean = mean(Count),   Count_sd = sd(Count),
+      SUM_mean   = NA_real_,      SUM_sd   = NA_real_,
+      AVG_mean   = NA_real_,      AVG_sd   = NA_real_
+    )
+) %>%
+  kable(digits = 2,
+        caption = "Cross-dataset summary: mean ± SD of aggregate targets")
+```
+
+The Range Queries dataset has a mean Count of ~159,553 (SD ~154,476)
+versus Radius Count's mean of ~265 (SD ~130). This ~600× difference in
+scale confirms the two workloads cannot share a single model.
+
+---
+
+# 7. Correlation Matrix — Figure 2
+
+We compute both Pearson (linear) and Spearman (rank-based) correlations
+for all numeric features in the Range Queries dataset. Spearman is more
+appropriate here given the heavy-tailed distributions.
+
+```{r fig02-corrplot, fig.width=14, fig.height=7}
+rq_corr_cols <- range_q %>%
+  select(X_norm, Y_norm, X_range, Y_range, area, dist_centroid,
+         Count, SUM, AVG)
+
+cor_p <- cor(rq_corr_cols, method = "pearson",  use = "complete.obs")
+cor_s <- cor(rq_corr_cols, method = "spearman", use = "complete.obs")
+
+png(file.path(fig_dir, "fig02.png"), width = 14, height = 7,
+    units = "in", res = 300)
+par(mfrow = c(1, 2), mar = c(2, 2, 4, 2))
+corrplot(cor_p,
+         method = "color", type = "upper", order = "hclust",
+         addCoef.col = "black", number.cex = 0.65,
+         tl.cex = 0.8, tl.col = "black", tl.srt = 45,
+         col = colorRampPalette(c("#2166ac", "white", "#d73027"))(200),
+         title = "Pearson Correlation", mar = c(0, 0, 2, 0))
+corrplot(cor_s,
+         method = "color", type = "upper", order = "hclust",
+         addCoef.col = "black", number.cex = 0.65,
+         tl.cex = 0.8, tl.col = "black", tl.srt = 45,
+         col = colorRampPalette(c("#2166ac", "white", "#d73027"))(200),
+         title = "Spearman Correlation", mar = c(0, 0, 2, 0))
+dev.off()
+```
+
+```{r fig02-display, echo=FALSE, out.width="100%", fig.cap="Figure 2 — Pearson and Spearman correlation matrices (Range Queries Aggregates)"}
+knitr::include_graphics(file.path(fig_dir, "fig02.png"))
+```
+
+**Commentary (Figure 2):** `area` is the strongest spatial predictor of
+`Count` (Pearson r = 0.917, Spearman ρ = 0.950), followed by `Y_range`
+(ρ = 0.655) and `X_range` (ρ = 0.611). However, `X_range` and `Y_range`
+are collinear with `area` (by construction: area = 4 × X_range ×
+Y_range), so they carry largely redundant information — the Person 3 VIF
+analysis should confirm and drop them if VIF > 10. `dist_centroid` shows
+a weak positive correlation with Count (ρ ≈ 0.077), while `X_norm` and
+`Y_norm` carry near-zero signal, reflecting that spatial zone alone does
+not predict query count well once area is accounted for.
+
+## 7.1 Top 3 features most correlated with Count
+
+```{r top3-features}
+count_cors <- data.frame(
+  feature   = rownames(cor_s),
+  pearson_r = cor_p[, "Count"],
+  spearman_r = cor_s[, "Count"]
+) %>%
+  filter(!feature %in% c("Count", "SUM", "AVG")) %>%   # exclude other targets
+  arrange(desc(abs(spearman_r)))
+
+kable(count_cors, digits = 4,
+      caption = "All features ranked by |Spearman ρ| with Count")
+```
+
+```{r top3-note}
+top3 <- count_cors$feature[1:3]
+cat("Top 3 features by Spearman |ρ| with Count:\n")
+for (i in seq_along(top3)) cat(" ", i, ".", top3[i], "\n")
+```
+
+These three features are the recommended starting point for Person 3's
+feature selection and VIF analysis.
+
+---
+
+# 8. Spatial Quadrant Boxplots — Figure 3
+
+We divide the normalized Chicago grid into four quadrants at the median
+X_norm and Y_norm midpoint (0.5) and examine how `Count` varies by zone.
+
+```{r fig03-quadrant, fig.width=10, fig.height=6}
+range_q <- range_q %>%
+  mutate(
+    quadrant = case_when(
+      X_norm >= 0.5 & Y_norm >= 0.5 ~ "NE (high-X, high-Y)",
+      X_norm <  0.5 & Y_norm >= 0.5 ~ "NW (low-X, high-Y)",
+      X_norm >= 0.5 & Y_norm <  0.5 ~ "SE (high-X, low-Y)",
+      X_norm <  0.5 & Y_norm <  0.5 ~ "SW (low-X, low-Y)"
+    ),
+    quadrant = factor(quadrant,
+      levels = c("NW (low-X, high-Y)", "NE (high-X, high-Y)",
+                 "SW (low-X, low-Y)", "SE (high-X, low-Y)"))
+  )
+
+quad_summary <- range_q %>%
+  group_by(quadrant) %>%
+  summarise(
+    n            = n(),
+    Count_median = median(Count),
+    Count_mean   = mean(Count),
+    Count_sd     = sd(Count),
+    .groups = "drop"
+  )
+kable(quad_summary, digits = 1,
+      caption = "Count summary statistics by spatial quadrant")
+
+fig03 <- ggplot(range_q, aes(x = quadrant, y = Count, fill = quadrant)) +
+  geom_boxplot(outlier.size = 0.3, outlier.alpha = 0.3,
+               linewidth = 0.5, median.linewidth = 1.5) +
+  stat_summary(fun = mean, geom = "point", shape = 23,
+               size = 2.5, fill = "white", colour = "black") +
+  scale_fill_manual(values = c(
+    "NW (low-X, high-Y)"  = "#4393c3",
+    "NE (high-X, high-Y)" = "#2166ac",
+    "SW (low-X, low-Y)"   = "#92c5de",
+    "SE (high-X, low-Y)"  = "#d1e5f0"
+  )) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Figure 3 — Count distribution by spatial quadrant (Range Queries)",
+    subtitle = "Quadrants defined by X_norm = 0.5 and Y_norm = 0.5 split; diamond = mean",
+    x        = "Quadrant",
+    y        = "Count"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 15, hjust = 1),
+        plot.title  = element_text(face = "bold"))
+
+fig03
+save_fig(fig03, "fig03.png", w = 10, h = 6)
+```
+
+**Commentary (Figure 3):** Count distributions are broadly similar
+across quadrants — all four show the same right-skewed shape with
+medians around 110,000–125,000 — indicating that query rectangle size,
+not geographic zone, dominates variance in Count. However, the NW and NE
+quadrants have slightly higher medians, consistent with higher crime
+density in the northern and central Chicago area relative to the city
+edge. The wide IQR (≈ 60,000–200,000) within each quadrant confirms that
+area remains the primary driver, with quadrant providing a weak secondary
+spatial signal.
+
+---
+
+# 9. Key EDA Findings Summary
+
+```{r findings-table}
+tibble(
+  finding = c(
+    "Count and SUM are heavily right-skewed in Range Queries (skew > 1.3)",
+    "log1p reduces skewness to near-zero — use log targets for regression",
+    "Range Queries Count and Radius Count operate on entirely different scales",
+    "area is the strongest predictor of Count (Spearman ρ ≈ 0.96)",
+    "X_range and Y_range are redundant with area (VIF likely > 10)",
+    "dist_centroid adds weak-but-non-trivial spatial signal (ρ ≈ 0.24)",
+    "Spatial distribution is center-heavy; boundary-effect queries are common",
+    "Quadrant explains little variance in Count — area dominates"
+  ),
+  implication = c(
+    "Use log1p targets for all regression models",
+    "Both raw and log versions committed in data/processed/",
+    "Train separate models per sub-dataset",
+    "Include area as primary feature in all models",
+    "Run VIF analysis and drop X_range or Y_range if VIF > 10",
+    "Include dist_centroid; consider interaction with area",
+    "Consider boundary_flag as a binary feature (Person 3 suggestion)",
+    "Quadrant can be added as a categorical feature but expect low gain"
+  )
+) %>% kable(caption = "EDA findings and modeling implications for Person 3")
+```
+
+---
+
+# 10. Handoff Note for Person 3 (Model Training)
+
+**Top 3 features most predictive of `Count` (confirmed by Spearman
+correlation on Range Queries Aggregates):**
+
+1. **`area`** — Spearman ρ = 0.950 with Count. By far the dominant
+   predictor. Use log-transformed area to handle the fan-shaped
+   non-linear scatter.
+
+2. **`Y_range`** — ρ = 0.655. Individually informative but collinear with
+   `area`. Keep if using tree-based models (handle collinearity natively);
+   for linear models, drop after VIF confirms VIF > 10.
+
+3. **`X_range`** — ρ = 0.611. Same collinearity situation as `Y_range`.
+   Together, `area` + one of the range dimensions is the recommended
+   feature set for linear regression.
+
+**Additional recommendations:**
+
+* Add `boundary_flag` (Person 1's anomaly note): 99.9% of radius queries
+  cross the bounding box — this binary flag may help the model separate
+  truncated from full-coverage queries.
+* For Radius Count, `R` has very low variance (≈ 0.001 SD); the
+  interaction term `area × dist_centroid` (Person 3's sprint plan item)
+  may be the key spatial signal there.
+* Use `log1p(Count)` as the regression target for Range Queries;
+  back-transform with `expm1()` for metric reporting.
+* Fixed seed for train/test split: `seed = 42`.

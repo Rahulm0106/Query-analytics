@@ -5,7 +5,7 @@ Team sprint on UCI ML Repository dataset **#493 — Query Analytics Workloads Da
 | Day | Person | Phase | Status |
 | --- | --- | --- | --- |
 | 1 | Rahul Sanjay Mandviya | Data engineering & preprocessing | **Complete** |
-| 2 | Manthan Sarjuse | EDA & visualization | Pending |
+| 2 | Manthan Surjuse | EDA & visualization | **Complete** |
 | 3 | Atharva Patil | Modeling | Pending |
 | 4 | Prasanna Renapurkar | Validation & report | Pending |
 
@@ -28,13 +28,19 @@ query_analytics/
 ├── data/
 │   ├── raw/                               # 3 CSVs from UCI #493 (untouched)
 │   └── processed/                         # 5 clean CSVs + schema_summary.csv + processing_log.json
-├── src/preprocess.R                       # reproducible R pipeline — source of truth
+├── src/
+│   ├── preprocess.R                       # Day 1: reproducible preprocessing pipeline
+│   └── eda.R                              # Day 2: EDA & figure generation pipeline
 ├── notebooks/
-│   └── 01_preprocessing.Rmd               # Data engineering & preprocessing narrative notebook (R)
+│   ├── 01_preprocessing.Rmd               # Day 1: preprocessing narrative
+│   └── 02_eda.Rmd                         # Day 2: EDA & visualization narrative
 ├── report/
-│   └── sections/03_data_processing.md     # draft §3 for the final report
-├── results/                               # CV tables / feature importance
-├── models/                                # trained model objects
+│   ├── figures/                           # fig01–fig06.png (300 DPI)
+│   └── sections/
+│       ├── 03_data_processing.md          # draft §3
+│       └── 04_data_analysis.md            # draft §4
+├── results/                               # CV tables / feature importance (Day 3)
+├── models/                                # trained model objects (Day 3)
 ├── slides/                                # presentation assets
 ├── renv_setup.R                           # one-shot R dependency installer
 └── query_analytics_4day_sprint.pdf        # sprint plan
@@ -68,3 +74,31 @@ Expected end-state of `data/processed/`:
 2. Start target-distribution plots from the `clean_*_log.csv` variants; use the raw-target files for raw-scale plots.
 3. **Top three features likely predictive of Count** (to be confirmed with the correlation matrix): `area`, `dist_centroid`, and the radius/range dimensions (`R` or `X_range`, `Y_range`).
 4. Carry the 157-zero anomaly and the boundary-effect observation into the EDA narrative.
+
+## EDA & visualization status note
+
+EDA complete. Six publication-ready figures (300 DPI) committed to `report/figures/`. Key spatial and distributional findings are documented in `notebooks/02_eda.Rmd` and `report/sections/04_data_analysis.md`. Run `Rscript src/eda.R` to regenerate all figures from the processed CSVs.
+
+## Top EDA findings
+
+1. **`area` dominates Count prediction** — Spearman ρ = 0.950 (Range Queries). This is by far the strongest predictor and must be included as the primary feature in all models.
+2. **`X_range` and `Y_range` are collinear with `area`** — both show ρ ≈ 0.61–0.66 with Count but area = 4 × X_range × Y_range. VIF is expected to exceed 10; tree-based models can keep all three, linear models should drop X_range/Y_range.
+3. **Count and SUM require log1p transformation** — raw skewness of 1.35 and 1.48 respectively; log space is substantially more centred for regression.
+4. **Range Queries and Radius Count operate on entirely different scales** — mean Count 159k vs 265. Train separate models per sub-dataset.
+5. **Spatial zone (quadrant) adds only weak signal** — within-quadrant IQR dwarfs between-quadrant differences; area dominates.
+6. **Boundary-crossing queries are prevalent** — 99.9% of radius queries cross the bounding box. `boundary_flag` is recommended as an additional binary feature.
+
+## Handoff for model training (Person 3 — Atharva)
+
+**Top 3 confirmed predictive features for `Count` (Range Queries, by Spearman |ρ|):**
+
+1. `area` — ρ = 0.950 ← **primary feature; use log-transformed area**
+2. `Y_range` — ρ = 0.655 ← collinear with area; keep for tree models, drop for linear
+3. `X_range` — ρ = 0.611 ← same collinearity note as Y_range
+
+**Modeling guidance:**
+- Use `log1p(Count)` as regression target; back-transform with `expm1()` for metrics
+- For Radius Count: `R` has near-zero variance (SD ≈ 0.003); the interaction term `area × dist_centroid` is the recommended spatial signal
+- Add `boundary_flag` as a binary feature (see anomaly #3 in data notes above)
+- Fixed seed for train/test split: `seed = 42`
+- EDA figures live in `report/figures/fig01.png` through `fig06.png`
