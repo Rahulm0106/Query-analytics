@@ -1,0 +1,746 @@
+---
+title: "Query Analytics Workloads - Feature Engineering & Model Training"
+subtitle: "Atharva Patil · AI/ML Engineer"
+author: "Team — UCI #493 Query Analytics Workloads"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+# Setup
+
+Run this chunk first — installs missing packages and creates output directories.
+
+```{r setup, message=FALSE, warning=FALSE}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+pkgs <- c("readr", "dplyr", "car", "randomForest", "xgboost", "FNN",
+          "ggplot2", "Metrics", "tidyr")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+
+library(readr);        library(dplyr);       library(car)
+library(randomForest); library(xgboost);     library(FNN)
+library(ggplot2);      library(Metrics);     library(tidyr)
+
+set.seed(42)
+dir.create("../results", showWarnings = FALSE)
+dir.create("../models",  showWarnings = FALSE)
+```
+
+---
+
+# Chunk 1 — Load Data
+
+```{r load-data, message=FALSE}
+range_log   <- read_csv("../data/processed/clean_range_queries_log.csv")
+radius_log  <- read_csv("../data/processed/clean_radius_count_log.csv")
+
+cat("Range Queries rows:", nrow(range_log), "| cols:", ncol(range_log), "\n")
+cat("Radius Count rows: ", nrow(radius_log), "| cols:", ncol(radius_log), "\n")
+glimpse(range_log)
+glimpse(radius_log)
+```
+
+---
+
+# Chunk 2 — Feature Engineering
+
+Adds three new features:
+
+- `aspect_ratio` — shape of the rectangle (range queries only)
+- `interact_area_dist` — non-linear spatial signal (area × dist_centroid)
+- `boundary_flag` — 1 if the query footprint crosses the dataset bounding box
+
+```{r feature-engineering}
+# ── Range Queries ──────────────────────────────────────────────────────────────
+# Derive bounding box from the data itself (mirrors preprocess.R logic)
+x_min_r <- min(range_log$X); x_max_r <- max(range_log$X)
+y_min_r <- min(range_log$Y); y_max_r <- max(range_log$Y)
+
+range_fe <- range_log %>%
+  mutate(
+    aspect_ratio       = X_range / (Y_range + 1e-9),
+    log_area           = log1p(area),
+    interact_area_dist = log_area * dist_centroid,
+    boundary_flag      = as.integer(
+      (X - X_range / 2 < x_min_r) | (X + X_range / 2 > x_max_r) |
+      (Y - Y_range / 2 < y_min_r) | (Y + Y_range / 2 > y_max_r)
+    )
+  )
+
+cat("Range boundary rows:", sum(range_fe$boundary_flag), "\n")  # expect ~1 373
+
+# ── Radius Count ───────────────────────────────────────────────────────────────
+# All 10 000 radius-count queries cross the bounding box (radius >> box extent
+# because coords are pre-normalised to ~[0,1]), so boundary_flag is constant
+# and excluded from modeling.
+radius_fe <- radius_log %>%
+  mutate(
+    log_area           = log1p(area),
+    interact_area_dist = area * dist_centroid
+  )
+
+cat("Radius boundary (all cross):", nrow(radius_fe), "rows\n")
+```
+
+---
+
+# Chunk 3 — VIF Analysis
+
+Detects multicollinearity; features with VIF > 10 are dropped from **linear** models (kept for tree-based models).
+
+```{r vif-analysis}
+# ── Range Queries: VIF on candidate linear features ───────────────────────────
+lm_vif_range <- lm(
+  log_Count ~ log_area + X_range + Y_range + dist_centroid +
+              aspect_ratio + interact_area_dist + boundary_flag,
+  data = range_fe
+)
+vif_range <- vif(lm_vif_range)
+print(round(vif_range, 2))
+
+# Features safe for linear model (VIF ≤ 10)
+safe_linear_range <- names(vif_range[vif_range <= 10])
+cat("\nSafe linear features (Range):", paste(safe_linear_range, collapse = ", "), "\n")
+
+# ── Radius Count: VIF ─────────────────────────────────────────────────────────
+# R and log_area are perfectly collinear (area = pi*R^2); interact_area_dist
+# is derived from both. Test a reduced set: log_area + dist_centroid + X_norm + Y_norm
+lm_vif_radius <- lm(
+  log_Count ~ log_area + dist_centroid + X_norm + Y_norm,
+  data = radius_fe
+)
+vif_radius <- vif(lm_vif_radius)
+print(round(vif_radius, 2))
+
+safe_linear_radius <- names(vif_radius[vif_radius <= 10])
+cat("\nSafe linear features (Radius):", paste(safe_linear_radius, collapse = ", "), "\n")
+```
+
+---
+
+# Chunk 4 — Train / Test Split  (80 / 20, seed = 42)
+
+```{r train-test-split}
+set.seed(42)
+
+# ── Range ──────────────────────────────────────────────────────────────────────
+n_range       <- nrow(range_fe)
+train_idx_r   <- sample(n_range, size = floor(0.8 * n_range))
+test_idx_r    <- setdiff(seq_len(n_range), train_idx_r)
+
+range_train   <- range_fe[train_idx_r, ]
+range_test    <- range_fe[test_idx_r,  ]
+
+# ── Radius Count ───────────────────────────────────────────────────────────────
+n_radius      <- nrow(radius_fe)
+train_idx_rad <- sample(n_radius, size = floor(0.8 * n_radius))
+test_idx_rad  <- setdiff(seq_len(n_radius), train_idx_rad)
+
+radius_train  <- radius_fe[train_idx_rad, ]
+radius_test   <- radius_fe[test_idx_rad,  ]
+
+# Export split indices for reproducibility
+write_csv(data.frame(index = train_idx_r,   split = "train"), "../results/split_range.csv")
+write_csv(data.frame(index = train_idx_rad, split = "train"), "../results/split_radius.csv")
+
+cat("Range  — train:", nrow(range_train),  "| test:", nrow(range_test),  "\n")
+cat("Radius — train:", nrow(radius_train), "| test:", nrow(radius_test), "\n")
+```
+
+---
+
+# Chunk 5 — Metric Helper
+
+```{r metrics-helper}
+# Returns a named vector: RMSE, MAE, R2, MAPE (all on original Count scale)
+calc_metrics <- function(actual_log, pred_log, label = "") {
+  actual <- expm1(actual_log)
+  pred   <- expm1(pred_log)
+  pred   <- pmax(pred, 0)   # floor negatives at 0
+
+  rmse_v <- rmse(actual, pred)
+  mae_v  <- mae(actual, pred)
+  r2_v   <- 1 - sum((actual - pred)^2) / sum((actual - mean(actual))^2)
+  mape_v <- mean(abs((actual - pred) / (actual + 1))) * 100  # +1 avoids /0
+
+  if (nchar(label) > 0) {
+    cat(sprintf("  %-8s RMSE=%-10.2f MAE=%-10.2f R2=%.4f MAPE=%.2f%%\n",
+                label, rmse_v, mae_v, r2_v, mape_v))
+  }
+  c(RMSE = rmse_v, MAE = mae_v, R2 = r2_v, MAPE = mape_v)
+}
+```
+
+---
+
+# Chunk 6 — Linear Regression
+
+## 6a. Range Queries (target: log_Count, secondary: log_SUM)
+
+Linear model uses only VIF-safe features to avoid inflated coefficients.
+
+```{r lm-range}
+# Features for linear model: exclude X_range, Y_range (collinear with log_area)
+lm_feats_range <- c("log_area", "dist_centroid", "interact_area_dist",
+                     "aspect_ratio", "boundary_flag")
+
+f_lm_range <- as.formula(
+  paste("log_Count ~", paste(lm_feats_range, collapse = " + "))
+)
+
+lm_range <- lm(f_lm_range, data = range_train)
+summary(lm_range)
+
+cat("\n── Range LM: Count ──\n")
+train_pred_lm_r <- predict(lm_range, range_train)
+test_pred_lm_r  <- predict(lm_range, range_test)
+lm_range_train  <- calc_metrics(range_train$log_Count, train_pred_lm_r, "Train")
+lm_range_test   <- calc_metrics(range_test$log_Count,  test_pred_lm_r,  "Test ")
+
+# Secondary: SUM
+f_lm_sum <- as.formula(
+  paste("log_SUM ~", paste(lm_feats_range, collapse = " + "))
+)
+lm_range_sum <- lm(f_lm_sum, data = range_train)
+cat("── Range LM: SUM ──\n")
+lm_sum_test <- calc_metrics(range_test$log_SUM, predict(lm_range_sum, range_test), "Test ")
+
+# Save metrics
+write_csv(
+  data.frame(
+    dataset = "range", model = "linear",
+    split   = c("train", "test"),
+    RMSE    = c(lm_range_train["RMSE"], lm_range_test["RMSE"]),
+    MAE     = c(lm_range_train["MAE"],  lm_range_test["MAE"]),
+    R2      = c(lm_range_train["R2"],   lm_range_test["R2"]),
+    MAPE    = c(lm_range_train["MAPE"], lm_range_test["MAPE"])
+  ),
+  "../results/model_linear.csv"
+)
+cat("\n[OK] results/model_linear.csv written\n")
+```
+
+## 6b. Radius Count
+
+```{r lm-radius}
+lm_feats_rad <- c("log_area", "dist_centroid", "X_norm", "Y_norm")
+
+f_lm_rad  <- as.formula(
+  paste("log_Count ~", paste(lm_feats_rad, collapse = " + "))
+)
+lm_radius <- lm(f_lm_rad, data = radius_train)
+summary(lm_radius)
+
+cat("\n── Radius LM: Count ──\n")
+lm_rad_train <- calc_metrics(radius_train$log_Count, predict(lm_radius, radius_train), "Train")
+lm_rad_test  <- calc_metrics(radius_test$log_Count,  predict(lm_radius, radius_test),  "Test ")
+
+write_csv(
+  data.frame(
+    dataset = "radius", model = "linear",
+    split   = c("train", "test"),
+    RMSE    = c(lm_rad_train["RMSE"], lm_rad_test["RMSE"]),
+    MAE     = c(lm_rad_train["MAE"],  lm_rad_test["MAE"]),
+    R2      = c(lm_rad_train["R2"],   lm_rad_test["R2"]),
+    MAPE    = c(lm_rad_train["MAPE"], lm_rad_test["MAPE"])
+  ),
+  "../results/model_linear_radius.csv"
+)
+```
+
+---
+
+# Chunk 7 — Random Forest (500 trees)
+
+> **Note:** RF on 160 000 rows may take 10–20 minutes. Grab a coffee.
+
+## 7a. Range Queries
+
+```{r rf-range, cache=TRUE}
+# Tree models keep all spatial features (VIF collinearity is not a concern)
+rf_feats_range <- c("log_area", "X_range", "Y_range", "dist_centroid",
+                    "aspect_ratio", "interact_area_dist", "boundary_flag",
+                    "X_norm", "Y_norm")
+
+X_train_r <- range_train[, rf_feats_range]
+X_test_r  <- range_test[,  rf_feats_range]
+y_train_r <- range_train$log_Count
+y_test_r  <- range_test$log_Count
+
+set.seed(42)
+rf_range <- randomForest(
+  x       = X_train_r,
+  y       = y_train_r,
+  ntree   = 500,
+  mtry    = floor(sqrt(length(rf_feats_range))),
+  importance = TRUE,
+  do.trace   = 100   # prints progress every 100 trees
+)
+
+cat("\n── RF Range: Count ──\n")
+rf_range_train <- calc_metrics(y_train_r, predict(rf_range, X_train_r), "Train")
+rf_range_test  <- calc_metrics(y_test_r,  predict(rf_range, X_test_r),  "Test ")
+
+# Feature importance
+imp_range <- importance(rf_range, type = 1)   # %IncMSE
+fi_range  <- data.frame(
+  feature    = rownames(imp_range),
+  importance = imp_range[, 1],
+  dataset    = "range",
+  model      = "randomForest"
+) %>% arrange(desc(importance))
+
+print(fi_range)
+
+write_csv(fi_range, "../results/feature_importance.csv")
+cat("\n[OK] results/feature_importance.csv written\n")
+```
+
+## 7b. Radius Count
+
+```{r rf-radius, cache=TRUE}
+rf_feats_rad <- c("R", "log_area", "dist_centroid",
+                  "interact_area_dist", "X_norm", "Y_norm")
+
+set.seed(42)
+rf_radius <- randomForest(
+  x       = radius_train[, rf_feats_rad],
+  y       = radius_train$log_Count,
+  ntree   = 500,
+  mtry    = floor(sqrt(length(rf_feats_rad))),
+  importance = TRUE,
+  do.trace   = 100
+)
+
+cat("\n── RF Radius: Count ──\n")
+rf_rad_train <- calc_metrics(radius_train$log_Count, predict(rf_radius, radius_train[, rf_feats_rad]), "Train")
+rf_rad_test  <- calc_metrics(radius_test$log_Count,  predict(rf_radius, radius_test[, rf_feats_rad]),  "Test ")
+```
+
+---
+
+# Chunk 8 — XGBoost with 5-Fold CV Grid Search
+
+## 8a. Range Queries — Count (primary)
+
+```{r xgb-range-count, cache=TRUE}
+xgb_feats_range <- c("log_area", "X_range", "Y_range", "dist_centroid",
+                     "aspect_ratio", "interact_area_dist", "boundary_flag",
+                     "X_norm", "Y_norm")
+
+dtrain_r <- xgb.DMatrix(
+  data  = as.matrix(range_train[, xgb_feats_range]),
+  label = range_train$log_Count
+)
+dtest_r  <- xgb.DMatrix(
+  data  = as.matrix(range_test[,  xgb_feats_range]),
+  label = range_test$log_Count
+)
+
+# Grid search
+grid_r <- expand.grid(
+  eta       = c(0.05, 0.1, 0.3),
+  max_depth = c(4, 6, 8),
+  subsample = c(0.7, 0.9)
+)
+
+cv_results_r <- vector("list", nrow(grid_r))
+
+for (i in seq_len(nrow(grid_r))) {
+  params <- list(
+    booster          = "gbtree",
+    objective        = "reg:squarederror",
+    eta              = grid_r$eta[i],
+    max_depth        = grid_r$max_depth[i],
+    subsample        = grid_r$subsample[i],
+    colsample_bytree = 0.8,
+    seed             = 42
+  )
+  cv <- xgb.cv(
+    params               = params,
+    data                 = dtrain_r,
+    nrounds              = 500,
+    nfold                = 5,
+    metrics              = "rmse",
+    early_stopping_rounds = 20,
+    verbose              = 0
+  )
+  best_rmse  <- min(cv$evaluation_log$test_rmse_mean)
+  best_round <- which.min(cv$evaluation_log$test_rmse_mean)
+  cv_results_r[[i]] <- data.frame(grid_r[i, ], best_rmse, best_round)
+  cat(sprintf("Grid %2d/%d | eta=%.2f depth=%d sub=%.1f | CV-RMSE=%.4f @ round %d\n",
+              i, nrow(grid_r),
+              grid_r$eta[i], grid_r$max_depth[i], grid_r$subsample[i],
+              best_rmse, best_round))
+}
+
+cv_summary_r <- bind_rows(cv_results_r)
+best_row_r   <- cv_summary_r[which.min(cv_summary_r$best_rmse), ]
+cat("\n── Best params (Range / Count) ──\n"); print(best_row_r)
+
+# Train final model with best params
+best_params_r <- list(
+  booster          = "gbtree",
+  objective        = "reg:squarederror",
+  eta              = best_row_r$eta,
+  max_depth        = best_row_r$max_depth,
+  subsample        = best_row_r$subsample,
+  colsample_bytree = 0.8,
+  seed             = 42
+)
+set.seed(42)
+xgb_range_count <- xgb.train(
+  params  = best_params_r,
+  data    = dtrain_r,
+  nrounds = best_row_r$best_round,
+  verbose = 0
+)
+
+cat("\n── XGB Range: Count ──\n")
+xgb_rc_train <- calc_metrics(range_train$log_Count, predict(xgb_range_count, dtrain_r), "Train")
+xgb_rc_test  <- calc_metrics(range_test$log_Count,  predict(xgb_range_count, dtest_r),  "Test ")
+```
+
+## 8b. Range Queries — SUM (secondary)
+
+```{r xgb-range-sum, cache=TRUE}
+dtrain_sum <- xgb.DMatrix(
+  data  = as.matrix(range_train[, xgb_feats_range]),
+  label = range_train$log_SUM
+)
+dtest_sum  <- xgb.DMatrix(
+  data  = as.matrix(range_test[,  xgb_feats_range]),
+  label = range_test$log_SUM
+)
+
+# Reuse best params found for Count (same feature space)
+set.seed(42)
+xgb_range_sum <- xgb.train(
+  params  = best_params_r,
+  data    = dtrain_sum,
+  nrounds = best_row_r$best_round,
+  verbose = 0
+)
+
+cat("\n── XGB Range: SUM ──\n")
+xgb_rs_train <- calc_metrics(range_train$log_SUM, predict(xgb_range_sum, dtrain_sum), "Train")
+xgb_rs_test  <- calc_metrics(range_test$log_SUM,  predict(xgb_range_sum, dtest_sum),  "Test ")
+```
+
+## 8c. Radius Count
+
+```{r xgb-radius-count, cache=TRUE}
+xgb_feats_rad <- c("R", "log_area", "dist_centroid",
+                   "interact_area_dist", "X_norm", "Y_norm")
+
+dtrain_rad <- xgb.DMatrix(
+  data  = as.matrix(radius_train[, xgb_feats_rad]),
+  label = radius_train$log_Count
+)
+dtest_rad  <- xgb.DMatrix(
+  data  = as.matrix(radius_test[,  xgb_feats_rad]),
+  label = radius_test$log_Count
+)
+
+grid_rad <- expand.grid(
+  eta       = c(0.05, 0.1, 0.3),
+  max_depth = c(4, 6),
+  subsample = c(0.7, 0.9)
+)
+
+cv_results_rad <- vector("list", nrow(grid_rad))
+for (i in seq_len(nrow(grid_rad))) {
+  params <- list(
+    booster          = "gbtree",
+    objective        = "reg:squarederror",
+    eta              = grid_rad$eta[i],
+    max_depth        = grid_rad$max_depth[i],
+    subsample        = grid_rad$subsample[i],
+    colsample_bytree = 0.8,
+    seed             = 42
+  )
+  cv <- xgb.cv(
+    params                = params,
+    data                  = dtrain_rad,
+    nrounds               = 300,
+    nfold                 = 5,
+    metrics               = "rmse",
+    early_stopping_rounds = 20,
+    verbose               = 0
+  )
+  best_rmse  <- min(cv$evaluation_log$test_rmse_mean)
+  best_round <- which.min(cv$evaluation_log$test_rmse_mean)
+  cv_results_rad[[i]] <- data.frame(grid_rad[i, ], best_rmse, best_round)
+  cat(sprintf("Grid %2d/%d | eta=%.2f depth=%d sub=%.1f | CV-RMSE=%.4f @ round %d\n",
+              i, nrow(grid_rad),
+              grid_rad$eta[i], grid_rad$max_depth[i], grid_rad$subsample[i],
+              best_rmse, best_round))
+}
+
+cv_summary_rad <- bind_rows(cv_results_rad)
+best_row_rad   <- cv_summary_rad[which.min(cv_summary_rad$best_rmse), ]
+cat("\n── Best params (Radius / Count) ──\n"); print(best_row_rad)
+
+best_params_rad <- list(
+  booster          = "gbtree",
+  objective        = "reg:squarederror",
+  eta              = best_row_rad$eta,
+  max_depth        = best_row_rad$max_depth,
+  subsample        = best_row_rad$subsample,
+  colsample_bytree = 0.8,
+  seed             = 42
+)
+set.seed(42)
+xgb_radius_count <- xgb.train(
+  params  = best_params_rad,
+  data    = dtrain_rad,
+  nrounds = best_row_rad$best_round,
+  verbose = 0
+)
+
+cat("\n── XGB Radius: Count ──\n")
+xgb_radc_train <- calc_metrics(radius_train$log_Count, predict(xgb_radius_count, dtrain_rad), "Train")
+xgb_radc_test  <- calc_metrics(radius_test$log_Count,  predict(xgb_radius_count, dtest_rad),  "Test ")
+```
+
+---
+
+# Chunk 9 — KNN Regressor (K = 5, 10, 20)
+
+Uses `FNN::knn.reg` — fast exact KNN.
+
+## 9a. Range Queries
+
+```{r knn-range}
+# Normalise features to [0,1] so Euclidean distance is meaningful
+norm_col <- function(x) (x - min(x)) / (max(x) - min(x) + 1e-12)
+
+knn_feats_range <- c("log_area", "dist_centroid", "X_norm", "Y_norm",
+                     "aspect_ratio", "interact_area_dist")
+
+X_knn_train_r <- as.matrix(range_train[, knn_feats_range] %>% mutate(across(everything(), norm_col)))
+X_knn_test_r  <- as.matrix(range_test[,  knn_feats_range] %>%
+                   mutate(across(everything(), ~(. - min(range_train[[cur_column()]])) /
+                                               (max(range_train[[cur_column()]]) - min(range_train[[cur_column()]]) + 1e-12))))
+
+knn_k_results_r <- list()
+best_knn_rmse_r <- Inf;  best_k_r <- 5
+
+for (k in c(5, 10, 20)) {
+  pred <- knn.reg(
+    train = X_knn_train_r,
+    test  = X_knn_test_r,
+    y     = range_train$log_Count,
+    k     = k
+  )$pred
+  m <- calc_metrics(range_test$log_Count, pred, paste0("K=", k))
+  knn_k_results_r[[as.character(k)]] <- m
+  if (m["RMSE"] < best_knn_rmse_r) { best_knn_rmse_r <- m["RMSE"]; best_k_r <- k }
+}
+cat("\nBest K for Range KNN:", best_k_r, "\n")
+```
+
+## 9b. Radius Count
+
+```{r knn-radius}
+knn_feats_rad <- c("log_area", "dist_centroid", "X_norm", "Y_norm", "interact_area_dist")
+
+X_knn_train_rad <- as.matrix(radius_train[, knn_feats_rad] %>% mutate(across(everything(), norm_col)))
+X_knn_test_rad  <- as.matrix(radius_test[,  knn_feats_rad] %>%
+                    mutate(across(everything(), ~(. - min(radius_train[[cur_column()]])) /
+                                                (max(radius_train[[cur_column()]]) - min(radius_train[[cur_column()]]) + 1e-12))))
+
+knn_k_results_rad <- list()
+best_knn_rmse_rad <- Inf; best_k_rad <- 5
+
+for (k in c(5, 10, 20)) {
+  pred <- knn.reg(
+    train = X_knn_train_rad,
+    test  = X_knn_test_rad,
+    y     = radius_train$log_Count,
+    k     = k
+  )$pred
+  m <- calc_metrics(radius_test$log_Count, pred, paste0("K=", k))
+  knn_k_results_rad[[as.character(k)]] <- m
+  if (m["RMSE"] < best_knn_rmse_rad) { best_knn_rmse_rad <- m["RMSE"]; best_k_rad <- k }
+}
+cat("\nBest K for Radius KNN:", best_k_rad, "\n")
+```
+
+---
+
+# Chunk 10 — Compile All Results
+
+```{r compile-results}
+make_row <- function(dataset, model, split, m) {
+  data.frame(dataset, model, split,
+             RMSE = m["RMSE"], MAE = m["MAE"], R2 = m["R2"], MAPE = m["MAPE"],
+             row.names = NULL)
+}
+
+# ── Range / Count ──────────────────────────────────────────────────────────────
+# Best KNN test metrics
+best_knn_pred_r <- knn.reg(
+  train = X_knn_train_r, test = X_knn_test_r,
+  y = range_train$log_Count, k = best_k_r
+)$pred
+knn_rc_test  <- calc_metrics(range_test$log_Count,  best_knn_pred_r, "")
+
+best_knn_pred_train_r <- knn.reg(
+  train = X_knn_train_r, test = X_knn_train_r,
+  y = range_train$log_Count, k = best_k_r
+)$pred
+knn_rc_train <- calc_metrics(range_train$log_Count, best_knn_pred_train_r, "")
+
+# ── Radius / Count ─────────────────────────────────────────────────────────────
+best_knn_pred_rad <- knn.reg(
+  train = X_knn_train_rad, test = X_knn_test_rad,
+  y = radius_train$log_Count, k = best_k_rad
+)$pred
+knn_radc_test <- calc_metrics(radius_test$log_Count,  best_knn_pred_rad, "")
+
+best_knn_pred_train_rad <- knn.reg(
+  train = X_knn_train_rad, test = X_knn_train_rad,
+  y = radius_train$log_Count, k = best_k_rad
+)$pred
+knn_radc_train <- calc_metrics(radius_train$log_Count, best_knn_pred_train_rad, "")
+
+# ── Assemble table ─────────────────────────────────────────────────────────────
+cv_comparison <- bind_rows(
+  make_row("range",  "linear",       "train", lm_range_train),
+  make_row("range",  "linear",       "test",  lm_range_test),
+  make_row("range",  "randomForest", "train", rf_range_train),
+  make_row("range",  "randomForest", "test",  rf_range_test),
+  make_row("range",  "xgboost",      "train", xgb_rc_train),
+  make_row("range",  "xgboost",      "test",  xgb_rc_test),
+  make_row("range",  paste0("knn_k", best_k_r), "train", knn_rc_train),
+  make_row("range",  paste0("knn_k", best_k_r), "test",  knn_rc_test),
+  make_row("radius", "linear",       "train", lm_rad_train),
+  make_row("radius", "linear",       "test",  lm_rad_test),
+  make_row("radius", "randomForest", "train", rf_rad_train),
+  make_row("radius", "randomForest", "test",  rf_rad_test),
+  make_row("radius", "xgboost",      "train", xgb_radc_train),
+  make_row("radius", "xgboost",      "test",  xgb_radc_test),
+  make_row("radius", paste0("knn_k", best_k_rad), "train", knn_radc_train),
+  make_row("radius", paste0("knn_k", best_k_rad), "test",  knn_radc_test)
+)
+
+print(cv_comparison, digits = 4)
+write_csv(cv_comparison, "../results/cv_comparison.csv")
+cat("\n[OK] results/cv_comparison.csv written\n")
+```
+
+---
+
+# Chunk 11 — Feature Importance Plot
+
+```{r feature-importance-plot, fig.width=8, fig.height=5}
+xgb_fi <- xgb.importance(
+  feature_names = xgb_feats_range,
+  model         = xgb_range_count
+)
+
+xgb_fi_df <- as.data.frame(xgb_fi) %>%
+  mutate(Feature = reorder(Feature, Gain))
+
+p_fi <- ggplot(xgb_fi_df, aes(x = Feature, y = Gain)) +
+  geom_col(fill = "#2E86AB") +
+  coord_flip() +
+  labs(
+    title    = "XGBoost Feature Importance — Range Queries (Count)",
+    subtitle = "Gain = average improvement in loss per split",
+    x = NULL, y = "Gain"
+  ) +
+  theme_minimal(base_size = 13)
+
+print(p_fi)
+ggsave("../report/figures/fig07_feature_importance.png", p_fi,
+       width = 8, height = 5, dpi = 300)
+cat("[OK] report/figures/fig07_feature_importance.png saved\n")
+
+# Append XGBoost importance to feature_importance.csv
+xgb_fi_export <- xgb_fi_df %>%
+  transmute(feature = as.character(Feature), importance = Gain,
+            dataset = "range", model = "xgboost")
+fi_combined <- bind_rows(fi_range, xgb_fi_export)
+write_csv(fi_combined, "../results/feature_importance.csv")
+```
+
+---
+
+# Chunk 12 — Save Model Objects
+
+```{r save-models}
+saveRDS(lm_range,         "../models/model_linear_range.rds")
+saveRDS(lm_radius,        "../models/model_linear_radius.rds")
+saveRDS(rf_range,         "../models/model_rf_range.rds")
+saveRDS(rf_radius,        "../models/model_rf_radius.rds")
+xgb.save(xgb_range_count, "../models/model_xgb_range_count.model")
+xgb.save(xgb_range_sum,   "../models/model_xgb_range_sum.model")
+xgb.save(xgb_radius_count,"../models/model_xgb_radius_count.model")
+
+# Save best-K info and training matrices for KNN (KNN needs training data at predict time)
+saveRDS(list(k = best_k_r,   X_train = X_knn_train_r,   y_train = range_train$log_Count),
+        "../models/model_knn_range.rds")
+saveRDS(list(k = best_k_rad, X_train = X_knn_train_rad, y_train = radius_train$log_Count),
+        "../models/model_knn_radius.rds")
+
+# Save XGBoost best hyperparameters
+xgb_best_params <- bind_rows(
+  mutate(best_row_r,   dataset = "range",  target = "Count"),
+  mutate(best_row_rad, dataset = "radius", target = "Count")
+)
+write_csv(xgb_best_params, "../results/xgb_best_params.csv")
+
+cat("[OK] All model objects saved to models/\n")
+cat("[OK] XGBoost best params saved to results/xgb_best_params.csv\n")
+list.files("../models/")
+```
+
+---
+
+# Chunk 13 — Model Comparison Table (for report)
+
+```{r model-table}
+# Pretty comparison table filtered to test set only
+test_summary <- cv_comparison %>%
+  filter(split == "test") %>%
+  arrange(dataset, RMSE) %>%
+  mutate(across(c(RMSE, MAE, MAPE), ~ round(., 2)),
+         R2 = round(R2, 4))
+
+knitr::kable(
+  test_summary,
+  caption = "Table 1. Test-Set Performance — All Models (Count target, original scale)",
+  col.names = c("Dataset", "Model", "Split", "RMSE", "MAE", "R²", "MAPE (%)")
+)
+```
+
+---
+
+# Summary
+
+```{r session-info}
+cat("── Best models by test RMSE ──\n")
+best_per_dataset <- test_summary %>%
+  group_by(dataset) %>%
+  slice_min(RMSE, n = 1)
+print(best_per_dataset)
+
+cat("\n── Deliverables written ──\n")
+cat("  results/cv_comparison.csv\n")
+cat("  results/feature_importance.csv\n")
+cat("  results/model_linear.csv\n")
+cat("  results/xgb_best_params.csv\n")
+cat("  results/split_range.csv  results/split_radius.csv\n")
+cat("  models/  (7 model files)\n")
+cat("  report/figures/fig07_feature_importance.png\n")
+
+sessionInfo()
+```
