@@ -1,0 +1,119 @@
+---
+title: "Predicting Spatial Query Selectivity on Chicago Crime Data"
+subtitle: "CSP 571 — UCI Dataset \\#493 Query Analytics Workloads"
+author:
+  - "Rahul Sanjay Mandviya · Manthan Surjuse · Atharva Patil · Prasanna Renapurkar"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    keep_tex: false
+    number_sections: false
+documentclass: article
+classoption:
+  - twocolumn
+  - 10pt
+geometry: "a4paper, margin=0.7in, columnsep=18pt"
+fontsize: 10pt
+linkcolor: black
+urlcolor: blue
+header-includes:
+  - \usepackage{float}
+  - \usepackage{graphicx}
+  - \usepackage{booktabs}
+  - \usepackage[font=small,labelfont=bf]{caption}
+  - \usepackage{titlesec}
+  - \titleformat*{\section}{\normalsize\bfseries}
+  - \titleformat*{\subsection}{\small\bfseries}
+  - \titlespacing*{\section}{0pt}{6pt}{2pt}
+  - \titlespacing*{\subsection}{0pt}{4pt}{1pt}
+  - \setlength{\parskip}{2pt}
+  - \setlength{\parindent}{0pt}
+  - \setlength{\textfloatsep}{6pt}
+  - \setlength{\intextsep}{6pt}
+  - \widowpenalty=10000
+  - \clubpenalty=10000
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = FALSE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.pos    = "H",
+  out.width  = "\\linewidth"
+)
+```
+
+```{r abstract, child="sections/01_abstract.md"}
+```
+
+```{r overview, child="sections/02_overview.md"}
+```
+
+```{r data-processing, child="sections/03_data_processing.md"}
+```
+
+```{r fig01, fig.cap="Range-query target distributions before and after log-transform; the log scale substantially reduces skewness for both Count and SUM."}
+knitr::include_graphics("figures/fig01.png")
+```
+
+```{r fig02, fig.cap="Spearman correlation matrix for Range Queries — area dominates Count (\\(\\rho = 0.95\\))."}
+knitr::include_graphics("figures/fig02.png")
+```
+
+```{r data-analysis, child="sections/04_data_analysis.md"}
+```
+
+```{r fig03, fig.cap="Spatial heat-map of mean Count across the Chicago bounding box; strong north–south structure."}
+knitr::include_graphics("figures/fig03.png")
+```
+
+```{r fig04, fig.cap="Boundary-crossing prevalence across the three sub-datasets — 99.9\\% of radius queries cross the bounding box."}
+knitr::include_graphics("figures/fig04.png")
+```
+
+```{r fig05, fig.cap="Per-feature distribution after preprocessing — engineered features are well-conditioned for regression."}
+knitr::include_graphics("figures/fig05.png")
+```
+
+```{r fig06, fig.cap="A representative sample of the 200{,}000 range query rectangles overlaid on the city bounding box."}
+knitr::include_graphics("figures/fig06.png")
+```
+
+```{r model-training, child="sections/05_model_training.md"}
+```
+
+```{r fig07, fig.cap="XGBoost feature importance (Gain) — Range Queries.", out.width="0.9\\linewidth"}
+knitr::include_graphics("figures/fig07_feature_importance.png")
+```
+
+```{r model-validation, child="sections/06_model_validation.md"}
+```
+
+```{r fig08, fig.cap="XGBoost residual diagnostics: log-scale residuals (top) and predicted-vs-actual (bottom) for Range and Radius test sets."}
+knitr::include_graphics("figures/fig08_residuals_xgb.png")
+```
+
+```{r fig09, fig.cap="Per-decile XGBoost test RMSE (Range Queries) — error rises monotonically with \\texttt{log\\_area}.", out.width="0.95\\linewidth"}
+knitr::include_graphics("figures/fig09_bias_by_quantile.png")
+```
+
+```{r fig10, fig.cap="K-Means clusters (K\\(^*\\) = 3 by silhouette) on Range Queries spatial features."}
+knitr::include_graphics("figures/fig10_clusters.png")
+```
+
+```{r model-performance, child="sections/07_model_performance.md"}
+```
+
+```{r conclusion, child="sections/08_conclusion.md"}
+```
+
+```{r data-sources, child="sections/09_data_sources.md"}
+```
+
+```{r source-code, child="sections/10_source_code.md"}
+```
+
+```{r bibliography, child="sections/11_bibliography.md"}
+```

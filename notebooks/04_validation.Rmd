@@ -1,0 +1,409 @@
+---
+title: "Query Analytics Workloads — Validation & Diagnostics"
+subtitle: "Prasanna Renapurkar · Validation & Report Integrator"
+author: "Team — UCI #493 Query Analytics Workloads"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+# Setup
+
+Run this chunk first — installs missing packages and creates output directories.
+
+```{r setup, message=FALSE, warning=FALSE}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+pkgs <- c("readr", "dplyr", "ggplot2", "xgboost", "cluster",
+          "Metrics", "tidyr", "viridis", "gridExtra", "scales")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+
+library(readr);  library(dplyr);   library(ggplot2)
+library(xgboost); library(cluster); library(Metrics)
+library(tidyr);  library(viridis); library(gridExtra); library(scales)
+
+set.seed(42)
+dir.create("../results",        showWarnings = FALSE)
+dir.create("../report/figures", showWarnings = FALSE, recursive = TRUE)
+```
+
+---
+
+# Chunk 1 — Load Data + Feature Engineering
+
+Mirrors `03_modeling.Rmd` Chunks 1–2 exactly so the validation re-derives the
+same feature matrices the trained models saw.
+
+```{r load-fe, message=FALSE}
+range_log  <- read_csv("../data/processed/clean_range_queries_log.csv")
+radius_log <- read_csv("../data/processed/clean_radius_count_log.csv")
+
+# Range FE
+x_min_r <- min(range_log$X); x_max_r <- max(range_log$X)
+y_min_r <- min(range_log$Y); y_max_r <- max(range_log$Y)
+
+range_fe <- range_log %>%
+  mutate(
+    aspect_ratio       = X_range / (Y_range + 1e-9),
+    log_area           = log1p(area),
+    interact_area_dist = log_area * dist_centroid,
+    boundary_flag      = as.integer(
+      (X - X_range / 2 < x_min_r) | (X + X_range / 2 > x_max_r) |
+      (Y - Y_range / 2 < y_min_r) | (Y + Y_range / 2 > y_max_r)
+    )
+  )
+
+# Radius FE — boundary_flag constant for radius queries, omitted
+radius_fe <- radius_log %>%
+  mutate(
+    log_area           = log1p(area),
+    interact_area_dist = area * dist_centroid
+  )
+
+cat("Range :", nrow(range_fe),  "rows\n")
+cat("Radius:", nrow(radius_fe), "rows\n")
+```
+
+---
+
+# Chunk 2 — Reproduce Train / Test Split (seed = 42)
+
+Saved model files in `models/` are Git-LFS pointer stubs in this checkout, so
+we re-create the 80/20 split with the same seed used in `03_modeling.Rmd`
+and refit XGBoost from `xgb_best_params.csv`. The split is identical to the
+one in `results/split_range.csv` / `results/split_radius.csv`.
+
+```{r split}
+set.seed(42)
+n_range       <- nrow(range_fe)
+train_idx_r   <- sample(n_range, size = floor(0.8 * n_range))
+test_idx_r    <- setdiff(seq_len(n_range), train_idx_r)
+range_train   <- range_fe[train_idx_r, ]
+range_test    <- range_fe[test_idx_r,  ]
+
+n_radius      <- nrow(radius_fe)
+train_idx_rad <- sample(n_radius, size = floor(0.8 * n_radius))
+test_idx_rad  <- setdiff(seq_len(n_radius), train_idx_rad)
+radius_train  <- radius_fe[train_idx_rad, ]
+radius_test   <- radius_fe[test_idx_rad,  ]
+
+cat(sprintf("Range  : train=%d  test=%d\n", nrow(range_train),  nrow(range_test)))
+cat(sprintf("Radius : train=%d  test=%d\n", nrow(radius_train), nrow(radius_test)))
+```
+
+---
+
+# Chunk 3 — Refit XGBoost (Range + Radius)
+
+```{r refit-xgb, cache=TRUE}
+best_params <- read_csv("../results/xgb_best_params.csv", show_col_types = FALSE)
+br_range  <- best_params %>% filter(dataset == "range")  %>% slice(1)
+br_radius <- best_params %>% filter(dataset == "radius") %>% slice(1)
+
+xgb_feats_range <- c("log_area", "X_range", "Y_range", "dist_centroid",
+                     "aspect_ratio", "interact_area_dist", "boundary_flag",
+                     "X_norm", "Y_norm")
+xgb_feats_rad   <- c("R", "log_area", "dist_centroid",
+                     "interact_area_dist", "X_norm", "Y_norm")
+
+dtrain_r   <- xgb.DMatrix(as.matrix(range_train [, xgb_feats_range]), label = range_train$log_Count)
+dtest_r    <- xgb.DMatrix(as.matrix(range_test  [, xgb_feats_range]), label = range_test $log_Count)
+dtrain_rad <- xgb.DMatrix(as.matrix(radius_train[, xgb_feats_rad]),   label = radius_train$log_Count)
+dtest_rad  <- xgb.DMatrix(as.matrix(radius_test [, xgb_feats_rad]),   label = radius_test $log_Count)
+
+set.seed(42)
+xgb_range <- xgb.train(
+  params  = list(objective = "reg:squarederror",
+                 eta = br_range$eta, max_depth = br_range$max_depth,
+                 subsample = br_range$subsample, colsample_bytree = 0.8, seed = 42),
+  data    = dtrain_r,
+  nrounds = br_range$best_round,
+  verbose = 0
+)
+
+set.seed(42)
+xgb_radius <- xgb.train(
+  params  = list(objective = "reg:squarederror",
+                 eta = br_radius$eta, max_depth = br_radius$max_depth,
+                 subsample = br_radius$subsample, colsample_bytree = 0.8, seed = 42),
+  data    = dtrain_rad,
+  nrounds = br_radius$best_round,
+  verbose = 0
+)
+
+# Predictions and residuals on test sets (log scale + original scale)
+range_test  <- range_test  %>% mutate(
+  pred_log  = predict(xgb_range,  dtest_r),
+  actual    = expm1(log_Count),
+  pred      = pmax(0, expm1(pred_log)),
+  resid_log = log_Count - pred_log,
+  resid     = actual - pred
+)
+radius_test <- radius_test %>% mutate(
+  pred_log  = predict(xgb_radius, dtest_rad),
+  actual    = expm1(log_Count),
+  pred      = pmax(0, expm1(pred_log)),
+  resid_log = log_Count - pred_log,
+  resid     = actual - pred
+)
+
+cat(sprintf("Range  XGB test RMSE = %10.2f  R^2 = %.4f\n",
+            rmse(range_test$actual,  range_test$pred),
+            1 - sum((range_test$actual  - range_test$pred )^2) /
+                sum((range_test$actual  - mean(range_test$actual ))^2)))
+cat(sprintf("Radius XGB test RMSE = %10.2f  R^2 = %.4f\n",
+            rmse(radius_test$actual, radius_test$pred),
+            1 - sum((radius_test$actual - radius_test$pred)^2) /
+                sum((radius_test$actual - mean(radius_test$actual))^2)))
+```
+
+---
+
+# Chunk 4 — Final Benchmark (`results/final_benchmark.csv`)
+
+Reshapes `results/cv_comparison.csv` into a single train+test side-by-side table
+(deliverable named in the sprint plan).
+
+```{r final-benchmark, message=FALSE}
+cv <- read_csv("../results/cv_comparison.csv", show_col_types = FALSE)
+
+final_bench <- cv %>%
+  pivot_wider(names_from = split,
+              values_from = c(RMSE, MAE, R2, MAPE),
+              names_sep = "_") %>%
+  arrange(dataset, RMSE_test)
+
+write_csv(final_bench, "../results/final_benchmark.csv")
+cat("[OK] results/final_benchmark.csv written\n")
+
+knitr::kable(final_bench, digits = 4,
+             caption = "Final benchmark — train and test metrics, all models")
+```
+
+---
+
+# Chunk 5 — M4: Residual Diagnostics for XGBoost
+
+Four-panel diagnostic figure:
+1. Range — fitted vs residual (log scale) with LOESS overlay → heteroscedasticity check
+2. Radius — fitted vs residual (log scale)
+3. Range — predicted vs actual (original Count scale)
+4. Radius — predicted vs actual
+
+Test sets are sub-sampled for plotting; metrics use the full test set.
+
+```{r residuals-xgb, fig.width=12, fig.height=9}
+set.seed(42)
+samp_r  <- sample_n(range_test,  size = min(5000, nrow(range_test)))
+samp_rd <- sample_n(radius_test, size = min(2000, nrow(radius_test)))
+
+p1 <- ggplot(samp_r, aes(pred_log, resid_log)) +
+  geom_point(alpha = 0.3, size = 0.6, color = "#2E86AB") +
+  geom_hline(yintercept = 0, color = "red", linewidth = 0.5) +
+  geom_smooth(method = "loess", color = "darkorange", se = FALSE, linewidth = 0.7) +
+  labs(title = "Range Queries — XGBoost Residuals (log scale)",
+       x = "Predicted log_Count", y = "Residual") +
+  theme_minimal(base_size = 12)
+
+p2 <- ggplot(samp_rd, aes(pred_log, resid_log)) +
+  geom_point(alpha = 0.4, size = 0.7, color = "#E63946") +
+  geom_hline(yintercept = 0, color = "red", linewidth = 0.5) +
+  geom_smooth(method = "loess", color = "darkorange", se = FALSE, linewidth = 0.7) +
+  labs(title = "Radius Count — XGBoost Residuals (log scale)",
+       x = "Predicted log_Count", y = "Residual") +
+  theme_minimal(base_size = 12)
+
+p3 <- ggplot(samp_r, aes(actual, pred)) +
+  geom_point(alpha = 0.3, size = 0.6, color = "#2E86AB") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Range Queries — Predicted vs Actual",
+       x = "Actual Count", y = "Predicted Count") +
+  theme_minimal(base_size = 12)
+
+p4 <- ggplot(samp_rd, aes(actual, pred)) +
+  geom_point(alpha = 0.4, size = 0.7, color = "#E63946") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Radius Count — Predicted vs Actual",
+       x = "Actual Count", y = "Predicted Count") +
+  theme_minimal(base_size = 12)
+
+fig08 <- arrangeGrob(p1, p2, p3, p4, ncol = 2)
+ggsave("../report/figures/fig08_residuals_xgb.png", fig08,
+       width = 12, height = 9, dpi = 300)
+grid::grid.draw(fig08)
+cat("[OK] report/figures/fig08_residuals_xgb.png saved\n")
+```
+
+---
+
+# Chunk 6 — D3 (part 1): Bias by `log_area` Decile (Range)
+
+XGBoost test-set RMSE is computed within each `log_area` decile to surface where
+the model under-performs.
+
+```{r bias-quantile, fig.width=8, fig.height=5}
+range_test_b <- range_test %>%
+  mutate(area_decile = ntile(log_area, 10))
+
+bias_decile <- range_test_b %>%
+  group_by(area_decile) %>%
+  summarise(
+    n           = n(),
+    min_area    = min(area),
+    max_area    = max(area),
+    mean_actual = mean(actual),
+    rmse        = rmse(actual, pred),
+    mae         = mae(actual, pred),
+    mape        = mean(abs((actual - pred) / (actual + 1))) * 100,
+    .groups     = "drop"
+  ) %>%
+  arrange(area_decile)
+
+write_csv(bias_decile, "../results/bias_by_decile.csv")
+knitr::kable(bias_decile, digits = 2,
+             caption = "XGBoost test-set error by log_area decile (Range)")
+
+p_bias <- ggplot(bias_decile, aes(factor(area_decile), rmse)) +
+  geom_col(fill = "#2E86AB") +
+  geom_text(aes(label = comma(round(rmse))), vjust = -0.4, size = 3) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
+  labs(title    = "Range Queries — XGBoost Test RMSE by Area Decile",
+       subtitle = "Decile 1 = smallest area, Decile 10 = largest",
+       x = "log_area decile", y = "RMSE (Count scale)") +
+  theme_minimal(base_size = 13)
+
+ggsave("../report/figures/fig09_bias_by_quantile.png", p_bias,
+       width = 8, height = 5, dpi = 300)
+print(p_bias)
+cat("[OK] report/figures/fig09_bias_by_quantile.png saved\n")
+```
+
+---
+
+# Chunk 7 — D1: K-Means K ∈ {3, 4, 5} with Silhouette Selection
+
+K-Means is fit on (X_norm, Y_norm, log_area_norm) for the Range Queries
+sub-dataset (largest sample, 200k rows). Silhouette score is computed on a
+5,000-row sample because `silhouette()` requires an n × n distance matrix
+(O(n²) memory).
+
+```{r kmeans, cache=TRUE}
+norm_min_max <- function(x) (x - min(x)) / (max(x) - min(x) + 1e-12)
+
+km_data <- range_fe %>%
+  transmute(X_norm,
+            Y_norm,
+            log_area_norm = norm_min_max(log_area)) %>%
+  as.matrix()
+
+set.seed(42)
+sil_idx  <- sample(nrow(km_data), 5000)
+sil_data <- km_data[sil_idx, ]
+sil_dist <- dist(sil_data)
+
+km_results <- list()
+sil_scores <- numeric(3)
+ks         <- c(3, 4, 5)
+
+for (i in seq_along(ks)) {
+  k <- ks[i]
+  set.seed(42)
+  km_full <- kmeans(km_data, centers = k, nstart = 10, iter.max = 50)
+  km_results[[as.character(k)]] <- km_full
+
+  set.seed(42)
+  km_sub <- kmeans(sil_data, centers = k, nstart = 10, iter.max = 50)
+  sil    <- silhouette(km_sub$cluster, sil_dist)
+  sil_scores[i] <- mean(sil[, 3])
+  cat(sprintf("K = %d  silhouette = %.4f  WSS = %.2f\n",
+              k, sil_scores[i], km_full$tot.withinss))
+}
+
+best_k  <- ks[which.max(sil_scores)]
+km_best <- km_results[[as.character(best_k)]]
+cat("\nBest K (silhouette):", best_k, "\n")
+
+range_fe$cluster <- factor(km_best$cluster)
+```
+
+---
+
+# Chunk 8 — D2: 2D Cluster Map
+
+```{r cluster-map, fig.width=8, fig.height=6}
+set.seed(42)
+samp_clu <- range_fe %>% sample_n(min(15000, n()))
+
+p_clu <- ggplot(samp_clu, aes(X_norm, Y_norm, color = cluster)) +
+  geom_point(alpha = 0.5, size = 0.4) +
+  scale_color_viridis_d(option = "plasma") +
+  coord_equal() +
+  labs(title    = paste0("Range Queries — K-Means Clusters (K = ", best_k, ")"),
+       subtitle = "Features: X_norm, Y_norm, normalised log_area",
+       x = "X (normalised)", y = "Y (normalised)") +
+  theme_minimal(base_size = 13) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+
+ggsave("../report/figures/fig10_clusters.png", p_clu,
+       width = 8, height = 6, dpi = 300)
+print(p_clu)
+cat("[OK] report/figures/fig10_clusters.png saved\n")
+```
+
+---
+
+# Chunk 9 — D3 (part 2): Bias by Spatial Cluster
+
+Joins each test row to its K-Means cluster (via `test_idx_r`) and reports
+per-cluster XGBoost RMSE — surfaces which Chicago zones the model handles
+worst.
+
+```{r bias-cluster}
+range_test_c <- range_test %>%
+  mutate(cluster = factor(km_best$cluster[test_idx_r]))
+
+bias_cluster <- range_test_c %>%
+  group_by(cluster) %>%
+  summarise(
+    n              = n(),
+    mean_actual    = mean(actual),
+    rmse           = rmse(actual, pred),
+    mae            = mae(actual, pred),
+    mape           = mean(abs((actual - pred) / (actual + 1))) * 100,
+    pct_boundary   = mean(boundary_flag) * 100,
+    .groups        = "drop"
+  ) %>%
+  arrange(desc(rmse))
+
+write_csv(bias_cluster, "../results/bias_by_cluster.csv")
+knitr::kable(bias_cluster, digits = 2,
+             caption = "XGBoost test-set error by K-Means cluster (Range)")
+```
+
+---
+
+# Summary
+
+```{r summary}
+cat("── Validation deliverables written ──\n")
+cat("  results/final_benchmark.csv\n")
+cat("  results/bias_by_decile.csv\n")
+cat("  results/bias_by_cluster.csv\n")
+cat("  report/figures/fig08_residuals_xgb.png\n")
+cat("  report/figures/fig09_bias_by_quantile.png\n")
+cat("  report/figures/fig10_clusters.png\n\n")
+
+cat(sprintf("Best K (silhouette): %d (silhouette = %.4f)\n",
+            best_k, max(sil_scores)))
+cat(sprintf("Range  XGB test RMSE: %.2f\n", rmse(range_test$actual,  range_test$pred)))
+cat(sprintf("Radius XGB test RMSE: %.2f\n", rmse(radius_test$actual, radius_test$pred)))
+
+sessionInfo()
+```
