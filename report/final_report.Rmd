@@ -1,6 +1,6 @@
 ---
 title: "Predicting Spatial Query Selectivity on Chicago Crime Data"
-subtitle: "CSP 571 — UCI Dataset Query Analytics Workloads"
+subtitle: "CSP 571 - UCI Dataset Query Analytics Workloads"
 author:
   - "Rahul Sanjay Mandviya · Manthan Surjuse · Atharva Patil · Prasanna Renapurkar"
 date: "`r format(Sys.Date(), '%B %Y')`"
@@ -60,7 +60,7 @@ knitr::opts_chunk$set(
 knitr::include_graphics("figures/fig01.png")
 ```
 
-```{r fig02, fig.cap="Spearman correlation matrix for Range Queries — area dominates Count (\\(\\rho = 0.95\\))."}
+```{r fig02, fig.cap="Spearman correlation matrix for Range Queries - area dominates Count (\\(\\rho = 0.95\\))."}
 knitr::include_graphics("figures/fig02.png")
 ```
 
@@ -71,14 +71,14 @@ knitr::include_graphics("figures/fig02.png")
 knitr::include_graphics("figures/fig03.png")
 ```
 
-```{r fig05, fig.cap="Per-feature distribution after preprocessing — engineered features are well-conditioned for regression."}
+```{r fig05, fig.cap="Per-feature distribution after preprocessing - engineered features are well-conditioned for regression."}
 knitr::include_graphics("figures/fig05.png")
 ```
 
 ```{r model-training, child="sections/05_model_training.md"}
 ```
 
-```{r fig07, fig.cap="XGBoost feature importance (Gain) — Range Queries.", out.width="0.9\\linewidth"}
+```{r fig07, fig.cap="XGBoost feature importance (Gain) - Range Queries.", out.width="0.9\\linewidth"}
 knitr::include_graphics("figures/fig07_feature_importance.png")
 ```
 
@@ -89,7 +89,7 @@ knitr::include_graphics("figures/fig07_feature_importance.png")
 knitr::include_graphics("figures/fig08_residuals_xgb.png")
 ```
 
-```{r fig09, fig.cap="Per-decile XGBoost test RMSE (Range Queries) — error rises monotonically with \\texttt{log\\_area}.", out.width="0.95\\linewidth"}
+```{r fig09, fig.cap="Per-decile XGBoost test RMSE (Range Queries) - error rises monotonically with \\texttt{log\\_area}.", out.width="0.95\\linewidth"}
 knitr::include_graphics("figures/fig09_bias_by_quantile.png")
 ```
 
