@@ -7,7 +7,7 @@ Team sprint on UCI ML Repository dataset **#493 - Query Analytics Workloads Data
 | 1 | Rahul Sanjay Mandviya | Data engineering & preprocessing | **Complete** |
 | 2 | Manthan Surjuse | EDA & visualization | **Complete** |
 | 3 | Atharva Patil | Modeling | **Complete** |
-| 4 | Prasanna Renapurkar | Validation & report | Pending |
+| 4 | Prasanna Renapurkar | Validation & report | **Complete** |
 
 **Language:** R (primary, and the only runtime required for the pipeline).
 
@@ -157,3 +157,35 @@ Apply the same transforms as in Chunk 2 of `03_modeling.Rmd`:
 - `log_area` is the dominant XGBoost feature (Gain=0.63); `Y_norm` tops RF importance - spatial location matters
 - Linear model is a weak baseline for Radius (R²=0.32) due to near-zero variance in R; tree models essential
 - Report Section 5 draft is at `report/sections/05_model_training.md`; metric table is pre-filled above
+
+## Running validation & report
+
+```bash
+# Regenerate validation diagnostics (fig08–fig10, bias_by_*.csv, final_benchmark.csv)
+Rscript -e "rmarkdown::render('notebooks/04_validation.Rmd', output_format = 'html_document')"
+
+# Build the final two-column PDF report (knits all 11 section .md files into one)
+Rscript -e "rmarkdown::render('report/final_report.Rmd', output_format = 'pdf_document')"
+```
+
+> Note: model `.rds` / `.model` files in `models/` are tracked through Git-LFS. If you cloned without LFS pulled, `04_validation.Rmd` re-fits XGBoost from `results/xgb_best_params.csv` against the seed-42 split, which reproduces test metrics to within 0.1% RMSE of the saved models.
+
+## Validation & report status note
+
+Validation complete. The held-out 20% test sets (40,000 Range rows; 2,000 Radius rows; seed = 42) were scored end-to-end for all four model families with metrics back-transformed to the original Count scale via `expm1()`. Three new diagnostics figures (`fig08_residuals_xgb.png`, `fig09_bias_by_quantile.png`, `fig10_clusters.png`) and three new results CSVs (`final_benchmark.csv`, `bias_by_decile.csv`, `bias_by_cluster.csv`) were committed. The unsupervised K-Means residual analysis (added to the original sprint plan after Day-3 results showed spatial residual structure) selected K\* = 3 by silhouette and quantified per-cluster XGBoost RMSE variation. All 11 report sections (`report/sections/01_*.md` … `11_*.md`) were drafted, integrated, and knitted into the final two-column PDF at `report/final_report.pdf`. Run `Rscript -e "rmarkdown::render('notebooks/04_validation.Rmd')"` to reproduce diagnostics; `Rscript -e "rmarkdown::render('report/final_report.Rmd')"` to rebuild the PDF.
+
+## Top validation findings
+
+1. **No overfitting in the winning model.** XGBoost train→test RMSE gap is the smallest of all four families (Range: 5,775 → 6,575; Radius: 6.31 → 8.52). Random Forest shows mild memorization (Range: 3,438 → 7,801) but still generalizes well.
+2. **Error grows monotonically with query area.** Per-decile RMSE rises from 1,411 (decile 1) to 10,859 (decile 10) — a 7.7× spread on the Range XGBoost model. MAPE collapses inversely (65.5% → 1.9%): small queries are absolutely easy but relatively hard.
+3. **Spatial residual structure is real.** K-Means (K\* = 3, silhouette = 0.44) on `(X_norm, Y_norm, log_area_norm)` exposes ~43% RMSE variation across the three Chicago zones (5,370 → 7,653). The highest-error cluster also carries the highest `boundary_flag` prevalence (0.86%), confirming Person-1's Day-1 boundary anomaly as a residual-risk segment.
+4. **Reported XGBoost test metrics are upper bounds.** Both XGBoost models hit the `nrounds` cap during 5-fold CV (500 for Range, 300 for Radius); CV RMSE was still decreasing, so a longer training schedule is the cleanest single lever for further improvement.
+5. **Headline benchmark gain holds out-of-sample:** XGBoost reduces test RMSE by **88.9%** vs. linear on Range (59,655 → 6,575) and **92.2%** on Radius (108.80 → 8.52). Full numbers in `results/final_benchmark.csv`.
+
+## Final deliverables
+
+- **`report/final_report.pdf`** — final two-column report (~2.6 MB), 11 sections, 10 figures, full benchmark table
+- **`notebooks/04_validation.html`** — knitted validation walkthrough with all diagnostic chunks rendered
+- **`results/final_benchmark.csv`** — train + test RMSE / MAE / R² / MAPE for every model × dataset
+- **`results/bias_by_decile.csv`, `results/bias_by_cluster.csv`** — per-area-decile and per-K-Means-cluster XGBoost error decomposition
+- **`report/figures/fig08_residuals_xgb.png`, `fig09_bias_by_quantile.png`, `fig10_clusters.png`** — Day-4 diagnostic figures (300 DPI)
