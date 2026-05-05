@@ -1,8 +1,8 @@
-# Section 5 — Model Training
+# Section 5 - Model Training
 
 ## 5.1 Feature Engineering
 
-Three features were engineered beyond those produced in Day 1. For range-query rectangles, *aspect ratio* (X_range / Y_range) captures the shape of each query footprint. An *interaction term* (log-area × dist_centroid) encodes the joint effect of query size and distance from the city centre — a large query far from the centroid behaves differently from a large query at the core. A binary *boundary flag* marks the 1,373 range queries (0.7 %) whose footprint crosses the dataset bounding box. All 10,000 radius-count queries cross the bounding box, so the flag is constant for that sub-dataset and excluded.
+Three features were engineered beyond those produced in Day 1. For range-query rectangles, *aspect ratio* (X_range / Y_range) captures the shape of each query footprint. An *interaction term* (log-area × dist_centroid) encodes the joint effect of query size and distance from the city centre, since a large query far from the centroid behaves differently from a large query at the core. A binary *boundary flag* marks the 1,373 range queries (0.7 %) whose footprint crosses the dataset bounding box. All 10,000 radius-count queries cross the bounding box, so the flag is constant for that sub-dataset and excluded.
 
 ## 5.2 Multicollinearity and Feature Selection
 
@@ -26,15 +26,4 @@ All models target `log1p(Count)` as the response; evaluation metrics are back-tr
 
 ## 5.5 Results Summary
 
-| Dataset | Model | Test RMSE | Test MAE | Test R² | Test MAPE |
-|---------|-------|-----------|----------|---------|-----------|
-| Range Queries | **XGBoost** | **6,575** | **4,411** | **0.9982** | 10.61% |
-| Range Queries | Random Forest | 7,801 | 4,668 | 0.9974 | 15.83% |
-| Range Queries | KNN (K=10) | 21,742 | 14,091 | 0.9801 | 22.24% |
-| Range Queries | Linear | 59,655 | 40,428 | 0.8505 | 82.02% |
-| Radius Count | **XGBoost** | **8.52** | **5.13** | **0.9958** | 2.31% |
-| Radius Count | Random Forest | 9.01 | 4.02 | 0.9953 | 1.96% |
-| Radius Count | KNN (K=5) | 10.56 | 6.05 | 0.9935 | 2.74% |
-| Radius Count | Linear | 108.80 | 83.21 | 0.3151 | 35.50% |
-
-XGBoost achieves the best test RMSE on both datasets, outperforming Random Forest by 16% on range queries (RMSE 6,575 vs 7,801) and 5% on radius count (RMSE 8.52 vs 9.01). The linear model degrades severely on radius count (R² = 0.32) due to near-zero variance in the radius feature, confirming that non-linear models are essential for this sub-dataset. The log-transform substantially reduced target skewness (raw skew ≈ 1.35 → near-zero post-transform), supporting better model fit across all four methods. All trained model objects are saved to `models/` in `.rds` / `.model` format for direct loading by Person 4 without retraining.
+XGBoost achieves the best test RMSE on both datasets (full benchmark in Table 1, §7), outperforming Random Forest by 16% on range queries (RMSE 6,575 vs 7,801) and 5% on radius count (RMSE 8.52 vs 9.01). The linear model degrades severely on radius count (R² = 0.32) due to near-zero variance in the radius feature, confirming that non-linear models are essential for this sub-dataset. The log-transform substantially reduced target skewness (raw skew ≈ 1.35 → near-zero post-transform), supporting better model fit across all four methods. All trained model objects are saved to `models/` in `.rds` / `.model` format for direct loading by Person 4 without retraining.

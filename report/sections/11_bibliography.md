@@ -1,4 +1,4 @@
-# Section 11 — Bibliography
+# Section 11 - Bibliography
 
 *Chicago author–date style (AMS/AIP variant).*
 

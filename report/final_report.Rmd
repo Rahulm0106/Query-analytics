@@ -1,6 +1,6 @@
 ---
 title: "Predicting Spatial Query Selectivity on Chicago Crime Data"
-subtitle: "CSP 571 — UCI Dataset \\#493 Query Analytics Workloads"
+subtitle: "CSP 571 — UCI Dataset Query Analytics Workloads"
 author:
   - "Rahul Sanjay Mandviya · Manthan Surjuse · Atharva Patil · Prasanna Renapurkar"
 date: "`r format(Sys.Date(), '%B %Y')`"
@@ -13,7 +13,7 @@ documentclass: article
 classoption:
   - twocolumn
   - 10pt
-geometry: "a4paper, margin=0.7in, columnsep=18pt"
+geometry: "a4paper, margin=0.55in, columnsep=16pt"
 fontsize: 10pt
 linkcolor: black
 urlcolor: blue
@@ -21,16 +21,18 @@ header-includes:
   - \usepackage{float}
   - \usepackage{graphicx}
   - \usepackage{booktabs}
-  - \usepackage[font=small,labelfont=bf]{caption}
   - \usepackage{titlesec}
   - \titleformat*{\section}{\normalsize\bfseries}
   - \titleformat*{\subsection}{\small\bfseries}
   - \titlespacing*{\section}{0pt}{6pt}{2pt}
   - \titlespacing*{\subsection}{0pt}{4pt}{1pt}
-  - \setlength{\parskip}{2pt}
+  - \setlength{\parskip}{1pt}
   - \setlength{\parindent}{0pt}
-  - \setlength{\textfloatsep}{6pt}
-  - \setlength{\intextsep}{6pt}
+  - \setlength{\textfloatsep}{4pt}
+  - \setlength{\intextsep}{4pt}
+  - \setlength{\abovecaptionskip}{2pt}
+  - \setlength{\belowcaptionskip}{0pt}
+  - \raggedbottom
   - \widowpenalty=10000
   - \clubpenalty=10000
 ---
@@ -69,16 +71,8 @@ knitr::include_graphics("figures/fig02.png")
 knitr::include_graphics("figures/fig03.png")
 ```
 
-```{r fig04, fig.cap="Boundary-crossing prevalence across the three sub-datasets — 99.9\\% of radius queries cross the bounding box."}
-knitr::include_graphics("figures/fig04.png")
-```
-
 ```{r fig05, fig.cap="Per-feature distribution after preprocessing — engineered features are well-conditioned for regression."}
 knitr::include_graphics("figures/fig05.png")
-```
-
-```{r fig06, fig.cap="A representative sample of the 200{,}000 range query rectangles overlaid on the city bounding box."}
-knitr::include_graphics("figures/fig06.png")
 ```
 
 ```{r model-training, child="sections/05_model_training.md"}
